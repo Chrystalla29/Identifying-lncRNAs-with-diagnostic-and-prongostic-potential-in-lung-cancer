@@ -19,39 +19,11 @@ The project includes:
 
 ## 📁 PROJECT STRUCTURE
 .
-├── data/                            # All expression matrices and DE results
-│   ├── LUAD_lncRNA.csv
-│   ├── LUAD_control_lncRNA.csv
-│   ├── LUAD_lncRNA_normalized_counts_DESeq2.csv
-│   ├── LUAD_lncRNA_log_trans_after_norm.csv
-│   ├── LUAD_DESeq2_all_results.csv
-│   ├── LUAD_DESeq2_all_results_shrunk.csv
-│   ├── LUAD_significant_survival_summary.csv
-│   ├── LUAD_survival_data.csv
-│   ├── LUSC_lncRNA.csv
-│   ├── LUSC_control_lncRNA.csv
-│   ├── LUSC_lncRNA_normalized_counts_DESeq2.csv
-│   ├── LUSC_lncRNA_log_trans_after_norm.csv
-│   ├── LUSC_DESeq2_all_results.csv
-│   ├── LUSC_DESeq2_all_results_shrunk.csv
-│   ├── LUSC_significant_survival_summary.csv
-│   ├── LUSC_survival_data.csv
-│   └── LUAD_LUSC_DEG_Venn.png (move this to `plots/`)
-│
-├── plots/                          # All plots and figures
-│   ├── LUAD_Top5_Boxplot.png
-│   ├── LUSC_Top5_Boxplot.png
-│   ├── LUAD_Top50_lncRNA_Heatmap.png
-│   ├── LUSC_Top50_lncRNA_Heatmap.png
-│   ├── MA_plot_LUAD.png
-│   ├── MA_plot_LUSC.png
-│   ├── LUAD_ENSG00000254166_survival.png
-│   ├── LUSC_ENSG00000234913_survival.png
-│   └── LUAD_LUSC_DEG_Venn.png
-│
-├── research_project_code.R         # Your full R pipeline
-├── README.md                       # Overview and instructions
-└── .git/                           # Git metadata
+├── data/                   # Processed expression, DE and survival data (CSV)
+├── plots/                  # All generated visualizations
+├── research_project_code.R # Main R analysis script
+├── README.md               # Project overview and usage
+└── .git/                   # Git version control
 
 
 ## OBJECTIVE
