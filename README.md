@@ -17,13 +17,12 @@ The project includes:
 
 ---
 
-## 📁 PROJECT STRUCTURE
-.
-├── data/                   # Processed expression, DE and survival data (CSV)
-├── plots/                  # All generated visualizations
-├── research_project_code.R # Main R analysis script
-├── README.md               # Project overview and usage
-└── .git/                   # Git version control
+## 📁 PROJECT CONTENT
+- `data/`: Contains all CSV files for expression counts, differential expression, and survival summaries.
+- `plots/`: Includes all visual outputs (e.g., MA plots, heatmaps, survival curves).
+- `research_project_code.R`: The main R script for the full bioinformatics pipeline.
+- `README.md`: You're here! The project overview and instructions.
+- `.git/`: Internal Git metadata.
 
 
 ## OBJECTIVE
