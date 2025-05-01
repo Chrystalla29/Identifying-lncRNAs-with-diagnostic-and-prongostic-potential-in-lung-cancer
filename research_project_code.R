@@ -466,35 +466,49 @@ LUSC_melt <- melt(LUSC_top, id.vars = "Gene")
 LUAD_melt$SampleType <- ifelse(grepl("_tumor$", LUAD_melt$variable, ignore.case = TRUE), "Tumor", "Normal")
 LUSC_melt$SampleType <- ifelse(grepl("_tumor$", LUSC_melt$variable, ignore.case = TRUE), "Tumor", "Normal")
 
+
 #  Plot LUAD 
 p_luad <- ggplot(LUAD_melt, aes(x = Gene, y = value, fill = SampleType)) +
   geom_boxplot(outlier.shape = NA, alpha = 0.7) +
-  stat_compare_means(aes(group = SampleType), method = "wilcox.test", label = "p.signif") +  # ⭐ add this line
+  stat_compare_means(aes(group = SampleType), method = "wilcox.test", label = "p.signif") +   
   scale_fill_manual(values = c("Normal" = "#F4A8A8", "Tumor" = "#A80000")) +
   theme_minimal(base_size = 13) +
   ggtitle("Top 5 DEGs in LUAD") +
   ylab("Log Transformed Count") +
   xlab("Gene") +
+  theme_minimal(base_size = 18) +  
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 28),  # Bigger, bold title
+    axis.title.x = element_text(size = 18, face = "bold"),             # Bold x-axis label
+    axis.title.y = element_text(size = 18, face = "bold"),             # Bold y-axis label
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),      # Larger gene labels
+    axis.text.y = element_text(size = 18),                             # Larger y tick text
+    legend.title = element_text(size = 18, face = "bold"),             # Bold legend title
+    legend.text = element_text(size = 18),                             # Larger legend items
     legend.position = "bottom"
   )
 
-ggsave("LUAD_Top5_Boxplot.png", plot = p_luad, width = 8, height = 5, dpi = 300)
+
+ggsave("LUAD_Top5_Boxplot.png", plot = p_luad, width = 8, height = 6, dpi = 300)
 
 # Plot LUSC 
 p_lusc <- ggplot(LUSC_melt, aes(x = Gene, y = value, fill = SampleType)) +
   geom_boxplot(outlier.shape = NA, alpha = 0.7) +
-  stat_compare_means(aes(group = SampleType), method = "wilcox.test", label = "p.signif") +  # ⭐ add here too
+  stat_compare_means(aes(group = SampleType), method = "wilcox.test", label = "p.signif") +  
   scale_fill_manual(values = c("Normal" = "#F4A8A8", "Tumor" = "#A80000")) +
   theme_minimal(base_size = 13) +
   ggtitle("Top 5 DEGs in LUSC") +
   ylab("Log Transformed Count") +
   xlab("Gene") +
+  theme_minimal(base_size = 18) +  
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 28),  # Bigger, bold title
+    axis.title.x = element_text(size = 18, face = "bold"),             # Bold x-axis label
+    axis.title.y = element_text(size = 18, face = "bold"),             # Bold y-axis label
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),      # Larger gene labels
+    axis.text.y = element_text(size = 18),                             # Larger y tick text
+    legend.title = element_text(size = 18, face = "bold"),             # Bold legend title
+    legend.text = element_text(size = 18),                             # Larger legend items
     legend.position = "bottom"
   )
 
@@ -504,7 +518,6 @@ ggsave("LUSC_Top5_Boxplot.png", plot = p_lusc, width = 8, height = 5, dpi = 300)
 # Show both plots
 print(p_luad)
 print(p_lusc)
-
 
 
 
