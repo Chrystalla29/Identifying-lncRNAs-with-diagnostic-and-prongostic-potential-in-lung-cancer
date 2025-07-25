@@ -1,4 +1,4 @@
-##LncRNA Biomarker Analysis in Lung Cancer (LUAD & LUSC)
+## LncRNA Biomarker Analysis in Lung Cancer (LUAD & LUSC)
 
 This repository contains a comprehensive pipeline for identifying and analyzing long non-coding RNAs (lncRNAs) as diagnostic and prognostic biomarkers in two lung cancer subtypes: 
 **LUAD (Lung Adenocarcinoma)** and **LUSC (Lung Squamous Cell Carcinoma)** using RNA-seq and clinical data from **The Cancer Genome Atlas (TCGA)**.
