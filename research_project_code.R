@@ -250,6 +250,7 @@ table(luad_matches$Matched_To_Tumor)
 table(lusc_matches$Matched_To_Tumor)
 
 
+
 #------------------------------- Normalize counts ------------------------------
 
 #Create a codition label for DESeq2
@@ -914,6 +915,88 @@ summary_table <- tibble(
 kbl(summary_table) %>%
   kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
 
+
+
+
+# -------- Build tumor-only, clinically matched expression matrices ------------
+#Load library
+library(readr)
+
+
+# helper: TCGA submitter_id (TCGA-XX-XXXX) from column names like "TCGA-XX-XXXX_tumor"
+to_submitter3 <- function(x) {
+  x <- gsub("(_tumor|_normal)$", "", x, ignore.case = TRUE)  # drop suffix
+  x <- gsub("\\.", "-", x)                                   # dots -> dashes
+  vapply(strsplit(x, "-"), function(p) {
+    if (length(p) >= 3) paste(p[1:3], collapse = "-") else NA_character_
+  }, character(1))
+}
+
+# collapse duplicate columns (replicates) by mean
+collapse_dupes_by_mean <- function(mat) {
+  ids <- colnames(mat)
+  idx <- split(seq_along(ids), ids)
+  out <- lapply(idx, function(j)
+    if (length(j) == 1) as.numeric(mat[, j])
+    else rowMeans(as.matrix(mat[, j, drop = FALSE]), na.rm = TRUE)
+  )
+  out <- do.call(cbind, out)
+  colnames(out) <- names(idx); rownames(out) <- rownames(mat)
+  out
+}
+
+# generic: from any expression CSV -> tumor-only, clinically matched matrix
+make_tumor_expr_matched <- function(expr_file, clinical_file, out_expr_csv, cancer_tag = "") {
+  
+  # load expression & clinical
+  expr <- read.csv(expr_file, row.names = 1, check.names = FALSE)  
+  clin <- read_csv(clinical_file, show_col_types = FALSE)
+  
+  # keep tumor-only columns (end with "_tumor")
+  tumor_cols <- grep("_tumor$", colnames(expr), value = TRUE, ignore.case = TRUE)
+  expr_tumor <- expr[, tumor_cols, drop = FALSE]
+  
+  # harmonize colnames to submitter_id format (TCGA-XX-XXXX) and collapse duplicates
+  colnames(expr_tumor) <- to_submitter3(colnames(expr_tumor))
+  expr_tumor <- expr_tumor[, !is.na(colnames(expr_tumor)), drop = FALSE]
+  expr_tumor <- collapse_dupes_by_mean(expr_tumor)
+  
+  # strip Ensembl version if present
+  rownames(expr_tumor) <- gsub("\\..*", "", rownames(expr_tumor))
+  
+  # align to clinical submitter_id (first 12 chars)
+  clin_ids <- substr(clin$submitter_id, 1, 12)
+  keep_ids <- intersect(colnames(expr_tumor), clin_ids)
+  
+  expr_matched <- expr_tumor[, keep_ids, drop = FALSE]
+  # (optional) reorder clinical if you’ll use it later side-by-side:
+  # clin <- clin[match(keep_ids, clin_ids), ]
+  
+  # save
+  write.csv(expr_matched, out_expr_csv)
+  cat("[", cancer_tag, "] tumor-only matched samples:", length(keep_ids), "\n")
+}
+
+#Apply function
+make_tumor_expr_matched(
+  expr_file = "LUAD_lncRNA_normalized_counts_DESeq2.csv",
+  clinical_file = "clinical_LUAD_clean.csv",
+  out_expr_csv = "LUAD_expr_matched.csv",
+  cancer_tag = "LUAD"
+)
+
+make_tumor_expr_matched(
+  expr_file = "LUSC_lncRNA_normalized_counts_DESeq2.csv",
+  clinical_file = "clinical_LUSC_clean.csv",
+  out_expr_csv = "LUSC_expr_matched.csv",
+  cancer_tag = "LUSC"
+)
+
+
+
+
+
+
 #-----------------------PCA for LUAD and LUSC lncRNAs---------------------------
 # Load required libraries
 library(ggplot2)
@@ -1143,135 +1226,143 @@ plot_stage_vs_normal_top15_facet_singlefile(
 
 
 
+
 # ------------------- General Survival Analysis --------------------------------
 # Performs KM survival analysis for each top lncRNA without stratifying
 library(survival)
 library(survminer)
-library(readr)   #Reading csvs
+library(ggplot2)  # ggsave()
+library(readr)    # Reading CSVs
 
-#Load necessary files
-LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1)
-LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1)
+#Re-read the matched expression files WITHOUT mangling names
+# (check.names = FALSE keeps the hyphens in TCGA barcodes; otherwise R turns
+# them into dots and sample IDs no longer match clinical submitter_id.)
+LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1, check.names = FALSE)
+LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1, check.names = FALSE)
 
+#Just in case: normalize any dots that might still be there
+# Ensure sample IDs look like "TCGA-XX-XXXX" (not "TCGA.XX.XXXX")
+colnames(LUAD_expr) <- gsub("\\.", "-", colnames(LUAD_expr))
+colnames(LUSC_expr) <- gsub("\\.", "-", colnames(LUSC_expr))
+
+#Load clinical and coerce IDs to 12-char submitter_id
 clinical_LUAD <- read_csv("clinical_LUAD_clean.csv", show_col_types = FALSE)
 clinical_LUSC <- read_csv("clinical_LUSC_clean.csv", show_col_types = FALSE)
 
+# Clinical IDs as 12-char submitter_id (TCGA-XX-XXXX) to match expression cols
+clinical_LUAD$submitter_id <- substr(as.character(clinical_LUAD$submitter_id), 1, 12)
+clinical_LUSC$submitter_id <- substr(as.character(clinical_LUSC$submitter_id), 1, 12)
 
-#Function to run survival analysis for top 15 genes
-#Inputs: expression data, clinical data, top 15 genes, master gene label, cancer type and whether to save all plots
 
-# Performs KM survival analysis for each top lncRNA using already-prepared clinical data
-# Performs cox proportional hazarda regression 
-
-combined_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes, master_gene_label, cancer_type, save_all_plots = TRUE) {
+#Function: KM + Cox per gene (High vs Low by median
+combined_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes,
+                                      master_gene_label, cancer_type,
+                                      save_all_plots = TRUE) {
+  #  harmonize IDs & match samples (VERY IMPORTANT
+  #  expr_matrix is genes x samples, with sample IDs as TCGA-XX-XXXX
+  #  clinical_df has submitter_id; we match on the first 12 chars
+  colnames(expr_matrix) <- gsub("\\.", "-", colnames(expr_matrix))  # safety
+  clin_ids <- substr(clinical_df$submitter_id, 1, 12)
   
-  # Initialize results list
-  results <- list()
+  # use only shared samples and put them in the SAME ORDER in both objects
+  use_ids <- intersect(colnames(expr_matrix), clin_ids)
+  if (length(use_ids) < 10) {
+    stop(paste("Too few matched samples for", cancer_type, ":", length(use_ids)))
+  }
   
-  # Clean gene IDs from the top15_genes and expression matrix
+  expr_matrix  <- expr_matrix[, use_ids, drop = FALSE]
+  clinical_df  <- clinical_df[match(use_ids, clin_ids), , drop = FALSE]
+  
+  # quick sanity check
+  if (ncol(expr_matrix) != nrow(clinical_df)) {
+    stop("Internal matching error: ncol(expr_matrix) != nrow(clinical_df)")
+  }
+  
+  # clean gene IDs (drop Ensembl version numbers like '.1', '.2', …)
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   rownames(expr_matrix) <- gsub("\\..*", "", rownames(expr_matrix))
   
-  # Loop over each gene
+  results <- list()
+  
+  # loop genes
   for (gene in top15_genes_clean) {
-    
-    #Check if top15 gene is in the expression matrix
+    # Check gene exists in the expression matrix
     if (!(gene %in% rownames(expr_matrix))) {
       message("Gene not found in expression matrix: ", gene)
       next
     }
     
-    # Get gene name from master gene label to change to gene symbol
+    # Map Ensembl -> HGNC symbol (fallback to Ensembl ID if missing)
     gene_name <- ifelse(
       is.na(master_gene_label[gene]) | master_gene_label[gene] == "",
-      gene,
-      master_gene_label[gene]
+      gene, master_gene_label[gene]
     )
     
-    # Create a dataframe with clinical data
+    # Working clinical DF for this gene (ordering preserved)
     df <- clinical_df
     
-    #Add expression data for the gene to the clinical data
-    df$expression <- as.numeric(expr_matrix[gene, ])
+    # Attach gene expression vector (length == nrow(df) by construction)
+    df$expression <- as.numeric(expr_matrix[gene, use_ids])
     
-    # Use precomputed survival columns
-    if (!("overall_survival" %in% colnames(df)) || !("deceased" %in% colnames(df))) {
-      message("Missing survival columns in clinical data for gene: ", gene_name)
+    # Require survival columns to be present
+    if (!("overall_survival" %in% names(df)) || !("deceased" %in% names(df))) {
+      message("Missing survival columns for gene: ", gene_name)
       next
     }
     
-    # after you create df$expression ...
-    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased), ]
+    # Drop rows with missing expr/survival
+    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased),
+             , drop = FALSE]
+    if (nrow(df) < 10) next
     
-    # dichotomize and set reference
+    # High/Low split using the median within the current gene-specific data
     df$group <- factor(
       ifelse(df$expression >= median(df$expression, na.rm = TRUE), "High", "Low"),
-      levels = c("Low", "High")   # <-- Low is reference
+      levels = c("Low", "High")  # Low as reference in Cox
     )
+    if (length(unique(df$group)) < 2) next
     
-    # KM and Cox (High vs Low)
+    # Kaplan–Meier + log-rank
     fit  <- survfit(Surv(overall_survival, deceased) ~ group, data = df)
-    cox  <- summary(coxph(Surv(overall_survival, deceased) ~ group, data = df))
-    
-    #If there are fewer than 10 patients or only one group, skip this gene
-    if (nrow(df) < 10 || length(unique(df$group)) < 2) next
-    
-    # Survival analysis
-    # Fit Kaplan-Meier survival curve
-    fit <- survfit(Surv(overall_survival, deceased) ~ group, data = df)
-    # Perform log-rank test
     test <- survdiff(Surv(overall_survival, deceased) ~ group, data = df)
-    # Calculate p-value from the test
     pval <- 1 - pchisq(test$chisq, df = 1)
     
+    # Cox proportional hazards (High vs Low)
+    cox <- tryCatch(
+      summary(coxph(Surv(overall_survival, deceased) ~ group, data = df)),
+      error = function(e) NULL
+    )
     
-    # Cox regression
-    cox <- tryCatch({
-      #Run cox proportional hazards model to evaluate the effect of the genes on survival
-      summary(coxph(Surv(overall_survival, deceased) ~ group, data = df))
-    }, error = function(e) NULL)
-    
-    # Collect results
+    # Collect results if Cox ran
     if (!is.null(cox)) {
-      # If cox is not NULL, it means the model ran successfully
       results[[length(results) + 1]] <- data.frame(
-        #Get gene ID and gene symbol
-        gene_id = gene,
+        gene_id     = gene,
         gene_symbol = gene_name,
-        #Get Hazard Ratio (HR)
-        HR = round(cox$coefficients[,"exp(coef)"], 3),
-        #Lower and upper bound og the 95% confidence interval for the HR
-        lower_CI = round(cox$conf.int[,"lower .95"], 3),
-        upper_CI = round(cox$conf.int[,"upper .95"], 3),
-        #p-value from the KM analysis
-        KM_pval = signif(pval, 3),
-        #p-value from the cox model
-        Cox_pval = signif(cox$coefficients[,"Pr(>|z|)"], 3)
+        HR          = round(cox$coefficients[, "exp(coef)"], 3),
+        lower_CI    = round(cox$conf.int[, "lower .95"], 3),
+        upper_CI    = round(cox$conf.int[, "upper .95"], 3),
+        KM_pval     = signif(pval, 3),
+        Cox_pval    = signif(cox$coefficients[, "Pr(>|z|)"], 3),
+        n           = nrow(df)
       )
     }
     
-    # Save plot if significant or requested
-    # If save_all_plots is TRUE then save all plots, otherwise only save if p-value is significant
+    # Save plot if requested or significant by KM
     if (save_all_plots || (!is.na(pval) && pval < 0.05)) {
-      # Create survival plot
       plot <- ggsurvplot(
-        fit,
-        data = df,
-        pval = TRUE,
+        fit, data = df, pval = TRUE,
         title = paste(gene_name, "in", cancer_type),
-        xlab = "Days",
-        ylab = "Survival Probability"
+        xlab = "Days", ylab = "Survival Probability"
       )
-      
-      filename <- paste0(cancer_type, "_", gene_name, "_survival.png")
-      ggsave(filename, plot = plot$plot, width = 6, height = 5, dpi = 300)
-      
+      ggsave(
+        paste0(cancer_type, "_", gene_name, "_survival.png"),
+        plot = plot$plot, width = 6, height = 5, dpi = 300
+      )
       cat("Saved plot for gene:", gene_name, "\n")
     }
   }
   
-  # Combine results
-  # If there are results, combine them into a data frame and save to CSV
+  # Write results
   if (length(results) > 0) {
     results_df <- do.call(rbind, results)
     write.csv(results_df, paste0(cancer_type, "_survival_results_ALL.csv"), row.names = FALSE)
@@ -1281,15 +1372,9 @@ combined_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes, mas
   }
 }
 
-
-#Applu funtion
-combined_survival_and_cox(expr_matrix = LUAD_expr,clinical_df = clinical_LUAD,top15_genes = top15_LUAD,
-                          master_gene_label = master_gene_label,cancer_type = "LUAD",save_all_plots = TRUE)
-
-combined_survival_and_cox(expr_matrix = LUSC_expr,clinical_df = clinical_LUSC,top15_genes = top15_LUSC,
-                          master_gene_label = master_gene_label,cancer_type = "LUSC",save_all_plots = TRUE)
-
-
+# Run for LUAD and LUSC
+combined_survival_and_cox(LUAD_expr, clinical_LUAD, top15_LUAD, master_gene_label, "LUAD", TRUE)
+combined_survival_and_cox(LUSC_expr, clinical_LUSC, top15_LUSC, master_gene_label, "LUSC", TRUE)
 
 
 #====== Plot Cox regression results (Forest Plot) ======
@@ -1301,8 +1386,9 @@ library(readr)     # For reading CSV files
 
 
 # Read the combined results for LUAD and LUSC from CSV files
-luad <- read_csv("LUAD_KM_Cox_combined_results.csv")
-lusc <- read_csv("LUSC_KM_Cox_combined_results.csv")
+luad <- read_csv("LUAD_survival_results_ALL.csv")
+lusc <- read_csv("LUSC_survival_results_ALL.csv")
+
 
 # Add a cancer type label and convert gene names to uppercase (for consistency)
 luad <- luad %>% mutate(cancer = "LUAD", gene_symbol = toupper(gene_symbol))
@@ -1494,8 +1580,10 @@ library(gridExtra)
 library(grid)
 
 #Load Correlation Results
-luad <- read.csv("LUAD_age_correlation_top15.csv")
-lusc <- read.csv("LUSC_age_correlation_top15.csv")
+# Load Correlation Results 
+luad <- read.csv("LUAD_tumor_age_correlation_top15.csv")
+lusc <- read.csv("LUSC_tumor_age_correlation_top15.csv")
+
 
 #Format LUAD Matrix 
 luad_filtered <- luad %>%
@@ -1599,13 +1687,15 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   
   # Function to fix sample IDs to match clinical$submitter_id
-  fix_sample_ids <- function(ids) {
-    sapply(ids, function(x) {
-      parts <- unlist(strsplit(as.character(x), split = "\\."))
-      parts <- parts[parts != ""]
-      if (length(parts) >= 3) paste(parts[1:3], collapse = "-") else NA
-    })
+  ffix_sample_ids <- function(ids) {
+    ids <- gsub("(_tumor|_normal)$", "", ids, ignore.case = TRUE)  # remove suffix
+    ids <- gsub("\\.", "-", ids)                                   # safety: dots -> dashes
+    vapply(ids, function(x) {
+      parts <- unlist(strsplit(x, "-"))
+      if (length(parts) >= 3) paste(parts[1:3], collapse = "-") else NA_character_
+    }, character(1))
   }
+  
   
   # Fix column names in expression matrix
   colnames(expr) <- fix_sample_ids(colnames(expr))
@@ -1726,15 +1816,42 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5("LUSC_lncRNA_log_trans_af
 library(survival)    # For survival models 
 library(survminer)   # For visualization of survival curves with ggplot2
 
+#Load required data
+LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1, check.names = FALSE)
+LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1, check.names = FALSE)
+clinical_LUAD <- read_csv("clinical_LUAD_clean.csv", show_col_types = FALSE)
+clinical_LUSC <- read_csv("clinical_LUSC_clean.csv", show_col_types = FALSE)
 
 # This function performs survival analysis for each age group (<65 and ≥65 years)
 # for each lncRNA significantly correlated with age.
 # It saves Kaplan-Meier plots and returns only those with log-rank p < 0.05.
-age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes, master_gene_label, cancer_type, save_all_plots = TRUE) {
-  
+age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes,
+                                            master_gene_label, cancer_type,
+                                            save_all_plots = TRUE) {
   # Initialize results list
   results <- list()
   
+  #ID HARMONIZATION & MATCHING (VERY IMPORTANT)
+  # expr_matrix is genes x samples with TCGA-XX-XXXX as colnames.
+  # clinical_df has submitter_id; we match on the first 12 chars.
+  colnames(expr_matrix) <- gsub("\\.", "-", colnames(expr_matrix))  # safety
+  clinical_df$submitter_id <- substr(as.character(clinical_df$submitter_id), 1, 12)
+  
+  use_ids <- intersect(colnames(expr_matrix), clinical_df$submitter_id)
+  if (length(use_ids) < 10) {
+    stop(paste("Too few matched samples for", cancer_type, ":", length(use_ids)))
+  }
+  
+  # Keep only shared samples in the SAME ORDER in both objects
+  expr_matrix <- expr_matrix[, use_ids, drop = FALSE]
+  clinical_df <- clinical_df[match(use_ids, clinical_df$submitter_id), , drop = FALSE]
+  
+  # Quick sanity check
+  if (ncol(expr_matrix) != nrow(clinical_df)) {
+    stop("Internal matching error: ncol(expr_matrix) != nrow(clinical_df)")
+  }
+  
+  #Clean gene IDs
   # Clean gene IDs
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   rownames(expr_matrix) <- gsub("\\..*", "", rownames(expr_matrix))
@@ -1755,9 +1872,11 @@ age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_gene
       master_gene_label[gene]
     )
     
+    # Build merged dataframe for this gene
     # Create merged dataframe
     df <- clinical_df
-    df$expression <- as.numeric(expr_matrix[gene, ])
+    # Attach expression vector (length equals nrow(df) by construction)
+    df$expression <- as.numeric(expr_matrix[gene, use_ids])
     
     # Check required survival columns exist
     if (!all(c("overall_survival", "deceased", "age_at_diagnosis") %in% colnames(df))) {
@@ -1769,7 +1888,9 @@ age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_gene
     df$age <- as.numeric(df$age_at_diagnosis) / 365
     
     # Filter out missing values
-    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased) & !is.na(df$age), ]
+    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) &
+               !is.na(df$deceased) & !is.na(df$age), , drop = FALSE]
+    if (nrow(df) < 10) next
     
     # Assign age group
     df$age_group <- ifelse(df$age < 65, "<65", "≥65")
@@ -1778,13 +1899,19 @@ age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_gene
     for (age_grp in unique(df$age_group)) {
       
       # Subset data for this age group
-      sub_df <- df[df$age_group == age_grp, ]
+      sub_df <- df[df$age_group == age_grp, , drop = FALSE]
+      
+      # Skip if too few samples
+      if (nrow(sub_df) < 10) next
       
       # Split into High/Low expression based on median
-      sub_df$group <- ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low")
+      sub_df$group <- factor(
+        ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low"),
+        levels = c("Low", "High")   # Low = reference for Cox
+      )
       
-      # Skip if too few samples or only one group
-      if (nrow(sub_df) < 10 || length(unique(sub_df$group)) < 2) next
+      # Skip if only one group present
+      if (length(unique(sub_df$group)) < 2) next
       
       # Fit Kaplan-Meier curve
       fit <- survfit(Surv(overall_survival, deceased) ~ group, data = sub_df)
@@ -1801,19 +1928,23 @@ age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_gene
       # If Cox regression ran successfully, store results
       if (!is.null(cox)) {
         results[[length(results) + 1]] <- data.frame(
-          gene_id = gene,
+          gene_id   = gene,
           gene_symbol = gene_name,
           age_group = age_grp,
-          HR = round(cox$coefficients[,"exp(coef)"], 3),
-          lower_CI = round(cox$conf.int[,"lower .95"], 3),
-          upper_CI = round(cox$conf.int[,"upper .95"], 3),
-          KM_pval = signif(pval, 3),
-          Cox_pval = signif(cox$coefficients[,"Pr(>|z|)"], 3)
+          HR        = round(cox$coefficients[, "exp(coef)"], 3),
+          lower_CI  = round(cox$conf.int[, "lower .95"], 3),
+          upper_CI  = round(cox$conf.int[, "upper .95"], 3),
+          KM_pval   = signif(pval, 3),
+          Cox_pval  = signif(cox$coefficients[, "Pr(>|z|)"], 3),
+          n         = nrow(sub_df)
         )
       }
       
       # Save plot if required
       if (save_all_plots || (!is.na(pval) && pval < 0.05)) {
+        # path-safe tag for filename
+        age_tag <- ifelse(age_grp == "<65", "lt65", "ge65")
+        
         plot <- ggsurvplot(
           fit,
           data = sub_df,
@@ -1823,7 +1954,7 @@ age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_gene
           ylab = "Survival Probability"
         )
         
-        filename <- paste0(cancer_type, "_", gene_name, "_Age", gsub("[<>]", "", age_grp), "_survival.png")
+        filename <- paste0(cancer_type, "_", gene_name, "_Age_", age_tag, "_survival.png")
         ggsave(filename, plot = plot$plot, width = 6, height = 5, dpi = 300)
         cat("Saved survival plot for:", gene_name, "- Age", age_grp, "\n")
       }
@@ -1834,11 +1965,13 @@ age_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_gene
   if (length(results) > 0) {
     results_df <- do.call(rbind, results)
     write.csv(results_df, paste0(cancer_type, "_age_stratified_survival_results_ALL.csv"), row.names = FALSE)
-    cat("Saved age-stratified survival results for", nrow(results_df), "gene/age group combinations in", cancer_type, "\n")
+    cat("Saved age-stratified survival results for", nrow(results_df),
+        "gene/age group combinations in", cancer_type, "\n")
   } else {
     cat("No valid survival results for", cancer_type, "\n")
   }
 }
+
 
 # Apply to LUAD
 age_stratified_survival_and_cox(expr_matrix = LUAD_expr,clinical_df = clinical_LUAD,top15_genes = top15_LUAD,
@@ -2083,10 +2216,39 @@ plot_top15_gender_boxplots_for_given_genes(expr_file = "LUSC_lncRNA_log_trans_af
 library(survival)    # For survival models 
 library(survminer)   # For visualization of survival curves with ggplot2
 
+
+#Load required data
+LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1, check.names = FALSE)
+LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1, check.names = FALSE)
+clinical_LUAD <- read_csv("clinical_LUAD_clean.csv", show_col_types = FALSE)
+clinical_LUSC <- read_csv("clinical_LUSC_clean.csv", show_col_types = FALSE)
+
+
 # This function performs survival analysis for each gender (male / female)
 # for each lncRNA significantly correlated with gender.
 # It saves Kaplan-Meier plots and returns results including KM p-value and Cox HR.
-gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes, master_gene_label, cancer_type, save_all_plots = TRUE) {
+gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes,
+                                               master_gene_label, cancer_type,
+                                               save_all_plots = TRUE) {
+  
+  # ID HARMONIZATION & MATCHING
+  # expr_matrix is genes x samples with TCGA-XX-XXXX as colnames.
+  # clinical_df has submitter_id; we match on the first 12 chars and REORDER
+  # the clinical rows to be in the SAME order as the expression columns.
+  colnames(expr_matrix) <- gsub("\\.", "-", colnames(expr_matrix))             # Just in case
+  clinical_df$submitter_id <- substr(as.character(clinical_df$submitter_id), 1, 12)
+  
+  use_ids <- intersect(colnames(expr_matrix), clinical_df$submitter_id)
+  if (length(use_ids) < 10) {
+    stop(paste("Too few matched samples for", cancer_type, ":", length(use_ids)))
+  }
+  
+  expr_matrix <- expr_matrix[, use_ids, drop = FALSE]
+  clinical_df <- clinical_df[match(use_ids, clinical_df$submitter_id), , drop = FALSE]
+  
+  if (ncol(expr_matrix) != nrow(clinical_df)) {
+    stop("Internal matching error: ncol(expr_matrix) != nrow(clinical_df)")
+  }
   
   # Initialize results list
   results <- list()
@@ -2094,6 +2256,13 @@ gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_g
   # Clean gene IDs
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   rownames(expr_matrix) <- gsub("\\..*", "", rownames(expr_matrix))
+  
+  # Standardize gender to "Male"/"Female" (ignore others/unknown)
+  g <- tolower(trimws(as.character(clinical_df$gender)))
+  gender_std <- rep(NA_character_, length(g))
+  gender_std[grepl("^m", g)] <- "Male"
+  gender_std[grepl("^f", g)] <- "Female"
+  clinical_df$gender_std <- factor(gender_std, levels = c("Male", "Female"))
   
   # Loop through each gene
   for (gene in top15_genes_clean) {
@@ -2113,25 +2282,32 @@ gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_g
     
     # Create merged dataframe
     df <- clinical_df
-    df$expression <- as.numeric(expr_matrix[gene, ])
+    # attach expression vector (length == nrow(df) by construction)
+    df$expression <- as.numeric(expr_matrix[gene, use_ids])
     
     # Check required survival columns exist
-    if (!all(c("overall_survival", "deceased", "gender") %in% colnames(df))) {
+    if (!all(c("overall_survival", "deceased", "gender_std") %in% colnames(df))) {
       message("Missing required columns for gene: ", gene_name)
       next
     }
     
     # Filter out missing values
-    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased) & !is.na(df$gender), ]
+    df <- df[!is.na(df$expression) &
+               !is.na(df$overall_survival) &
+               !is.na(df$deceased) &
+               !is.na(df$gender_std), , drop = FALSE]
     
     # Loop over gender groups
-    for (sex in unique(df$gender)) {
+    for (sex in levels(df$gender_std)) {
       
       # Subset data for this gender
-      sub_df <- df[df$gender == sex, ]
+      sub_df <- df[df$gender_std == sex, , drop = FALSE]
       
       # Split into High/Low expression based on median
-      sub_df$group <- ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low")
+      sub_df$group <- factor(
+        ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low"),
+        levels = c("Low", "High")   # Low = reference in Cox
+      )
       
       # Skip if too few samples or only one expression group
       if (nrow(sub_df) < 10 || length(unique(sub_df$group)) < 2) next
@@ -2151,19 +2327,23 @@ gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_g
       # If Cox regression ran successfully, store results
       if (!is.null(cox)) {
         results[[length(results) + 1]] <- data.frame(
-          gene_id   = gene,
+          gene_id     = gene,
           gene_symbol = gene_name,
-          gender    = sex,
-          HR        = round(cox$coefficients[,"exp(coef)"], 3),
-          lower_CI  = round(cox$conf.int[,"lower .95"], 3),
-          upper_CI  = round(cox$conf.int[,"upper .95"], 3),
-          KM_pval   = signif(pval, 3),
-          Cox_pval  = signif(cox$coefficients[,"Pr(>|z|)"], 3)
+          gender      = sex,
+          HR          = round(cox$coefficients[, "exp(coef)"], 3),
+          lower_CI    = round(cox$conf.int[, "lower .95"], 3),
+          upper_CI    = round(cox$conf.int[, "upper .95"], 3),
+          KM_pval     = signif(pval, 3),
+          Cox_pval    = signif(cox$coefficients[, "Pr(>|z|)"], 3),
+          n           = nrow(sub_df)
         )
       }
       
       # Save plot if required
       if (save_all_plots || (!is.na(pval) && pval < 0.05)) {
+        # filename-safe gender tag
+        sex_tag <- tolower(gsub("[^A-Za-z0-9]+", "", sex))
+        
         plot <- ggsurvplot(
           fit,
           data = sub_df,
@@ -2173,7 +2353,7 @@ gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_g
           ylab = "Survival Probability"
         )
         
-        filename <- paste0(cancer_type, "_", gene_name, "_Gender_", sex, "_survival.png")
+        filename <- paste0(cancer_type, "_", gene_name, "_Gender_", sex_tag, "_survival.png")
         ggsave(filename, plot = plot$plot, width = 6, height = 5, dpi = 300)
         cat("Saved survival plot for:", gene_name, "- Gender", sex, "\n")
       }
@@ -2184,7 +2364,8 @@ gender_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_g
   if (length(results) > 0) {
     results_df <- do.call(rbind, results)
     write.csv(results_df, paste0(cancer_type, "_gender_stratified_survival_results_ALL.csv"), row.names = FALSE)
-    cat("Saved gender-stratified survival results for", nrow(results_df), "gene/gender combinations in", cancer_type, "\n")
+    cat("Saved gender-stratified survival results for", nrow(results_df),
+        "gene/gender combinations in", cancer_type, "\n")
   } else {
     cat("No valid survival results for", cancer_type, "\n")
   }
@@ -2199,7 +2380,7 @@ gender_stratified_survival_and_cox(expr_matrix = LUSC_expr,clinical_df = clinica
                                    master_gene_label = master_gene_label,cancer_type = "LUSC",save_all_plots = TRUE)
 
 
-#------------------------- Smoking-Based Analysis of lncRNAs (3 groups) ----------------------
+#------------------------- Smoking-Based Analysis of lncRNAs --------------------
 # Load required libraries
 library(dplyr)               # Data wrangling
 
@@ -2375,7 +2556,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
   # Ensure sample_type is valid ("tumor" or "normal")
   sample_type <- match.arg(sample_type)
   
-  # Step 1: Load expression matrix
+  # Load expression matrix
   expr <- read.csv(expr_file, row.names = 1)
   
   # Filter columns based on sample type suffix
@@ -2392,7 +2573,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
     return(invisible(NULL))
   }
   
-  # Step 2: Load clinical data
+  # Load clinical data
   clinical <- read.csv(clinical_file)
   
   # Standardize column names in expression matrix to match clinical IDs
@@ -2401,7 +2582,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
   # Add smoking group classification to clinical data
   clinical <- add_smoking_group(clinical)
   
-  # Step 3: Match samples between expression and clinical datasets
+  # Match samples between expression and clinical datasets
   common_samples <- intersect(colnames(expr), clinical$submitter_id)
   
   # Subset both datasets to matched samples
@@ -2414,7 +2595,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
     return(invisible(NULL))
   }
   
-  # Step 4: Clean gene IDs (remove version numbers, e.g., ENSG00000.1 → ENSG00000)
+  # Clean gene IDs (remove version numbers, e.g., ENSG00000.1 → ENSG00000)
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   rownames(expr) <- gsub("\\..*", "", rownames(expr))
   
@@ -2424,7 +2605,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
     levels = c("Never smoker", "Ex-smoker", "Current smoker")
   )
   
-  # Step 5: Generate plots for each Top 15 gene
+  # Generate plots for each Top 15 gene
   for (gene in top15_genes_clean) {
     if (gene %in% rownames(expr)) {
       
@@ -2463,7 +2644,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
         master_gene_label[gene]
       )
       
-      # Step 6: Build boxplot with statistical annotations
+      # Build boxplot with statistical annotations
       p <- ggplot(df, aes(x = smoking_group, y = expression, fill = smoking_group)) +
         geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.5) +
         # Add Wilcoxon test p-values if we have valid group pairs
@@ -2501,7 +2682,7 @@ plot_top15_smoking_genes <- function(expr_file, clinical_file, top15_genes, mast
           plot.title  = element_text(size = 22, face = "bold")
         )
       
-      # Step 7: Save plot to file
+      # Save plot to file
       ggsave(
         filename = paste0(cancer_type, "_", sample_type, "_", gene_symbol, "_Top15_Smoking_Boxplot.png"),
         plot = p, width = 10, height = 8, dpi = 300
@@ -2544,10 +2725,36 @@ library(survminer)   # For visualization of survival curves with ggplot2
 library(dplyr)       # For data manipulation
 library(stringr)     # For safe filename text wrapping/cleaning (used in plot title)
 
+
+#Load required data
+LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1, check.names = FALSE)
+LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1, check.names = FALSE)
+clinical_LUAD <- read_csv("clinical_LUAD_clean.csv", show_col_types = FALSE)
+clinical_LUSC <- read_csv("clinical_LUSC_clean.csv", show_col_types = FALSE)
+
+
 # This function performs survival analysis within each smoking group
-# ("Never smoker", "Ex-smoker", "Current smoker") for each lncRNA.
-# It saves Kaplan-Meier plots and returns KM p-values and Cox HRs/CIs.
-smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes, master_gene_label, cancer_type, save_all_plots = TRUE) {
+smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes,
+                                                master_gene_label, cancer_type,
+                                                save_all_plots = TRUE) {
+  #ID HARMONIZATION & MATCHING (VERY IMPORTANT)
+  # expr_matrix is genes x samples with TCGA-XX-XXXX as colnames.
+  # clinical_df has submitter_id; we match on the first 12 chars and REORDER
+  # the clinical rows to be in the SAME order as the expression columns.
+  colnames(expr_matrix) <- gsub("\\.", "-", colnames(expr_matrix))                # Just in case
+  clinical_df$submitter_id <- substr(as.character(clinical_df$submitter_id), 1, 12)
+  
+  use_ids <- intersect(colnames(expr_matrix), clinical_df$submitter_id)
+  if (length(use_ids) < 10) {
+    stop(paste("Too few matched samples for", cancer_type, ":", length(use_ids)))
+  }
+  
+  expr_matrix <- expr_matrix[, use_ids, drop = FALSE]
+  clinical_df <- clinical_df[match(use_ids, clinical_df$submitter_id), , drop = FALSE]
+  
+  if (ncol(expr_matrix) != nrow(clinical_df)) {
+    stop("Internal matching error: ncol(expr_matrix) != nrow(clinical_df)")
+  }
   
   # Initialize results list
   results <- list()
@@ -2557,15 +2764,17 @@ smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_
   rownames(expr_matrix) <- gsub("\\..*", "", rownames(expr_matrix))
   
   # Ensure smoking status is available and create 3-group variable
+  # (more robust recoding using case-insensitive matching)
   if (!"tobacco_smoking_status" %in% colnames(clinical_df)) {
     message("Missing 'tobacco_smoking_status' in clinical_df.")
     return(invisible(NULL))
   }
+  smoking_raw <- tolower(trimws(as.character(clinical_df$tobacco_smoking_status)))
   clinical_df$smoking_group <- dplyr::case_when(
-    clinical_df$tobacco_smoking_status == "Lifelong Non-Smoker" ~ "Never smoker",
-    grepl("Reformed", clinical_df$tobacco_smoking_status) ~ "Ex-smoker",
-    clinical_df$tobacco_smoking_status == "Current Smoker" ~ "Current smoker",
-    TRUE ~ NA_character_
+    grepl("non[- ]?smoker|never", smoking_raw)           ~ "Never smoker",
+    grepl("reformed|former|ex", smoking_raw)             ~ "Ex-smoker",
+    grepl("current", smoking_raw)                        ~ "Current smoker",
+    TRUE                                                 ~ NA_character_
   )
   clinical_df$smoking_group <- factor(
     clinical_df$smoking_group,
@@ -2581,7 +2790,7 @@ smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_
       message("Missing survival columns. Provide overall_survival & deceased, or vital_status/days_to_*.")
       return(invisible(NULL))
     }
-    clinical_df$deceased <- as.numeric(clinical_df$vital_status != "Alive")
+    clinical_df$deceased <- as.numeric(clinical_df$vital_status != "Alive")  # 1 = event
     clinical_df$overall_survival <- ifelse(
       clinical_df$deceased == 1,
       as.numeric(clinical_df$days_to_death),
@@ -2607,21 +2816,29 @@ smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_
     
     # Create merged dataframe
     df <- clinical_df
-    df$expression <- as.numeric(expr_matrix[gene, ])
+    # attach expression vector (length == nrow(df) by construction)
+    df$expression <- as.numeric(expr_matrix[gene, use_ids])
     
     # Filter out missing values required for survival and smoking
-    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased) & !is.na(df$smoking_group), ]
+    df <- df[!is.na(df$expression) &
+               !is.na(df$overall_survival) &
+               !is.na(df$deceased) &
+               !is.na(df$smoking_group), , drop = FALSE]
     if (nrow(df) < 10) next
     
     # Loop over smoking groups
-    for (smoking in unique(df$smoking_group)) {
+    for (smoking in levels(df$smoking_group)) {
+      if (is.na(smoking)) next
       
       # Subset data for this smoking group
-      sub_df <- df[df$smoking_group == smoking, ]
+      sub_df <- df[df$smoking_group == smoking, , drop = FALSE]
       if (nrow(sub_df) < 10) next
       
       # Split into High/Low expression based on median
-      sub_df$group <- ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low")
+      sub_df$group <- factor(
+        ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low"),
+        levels = c("Low", "High")   # Low = reference in Cox
+      )
       
       # Skip if only one group remains
       if (length(unique(sub_df$group)) < 2) next
@@ -2641,37 +2858,44 @@ smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_
       # Store results if Cox regression ran successfully
       if (!is.null(cox)) {
         results[[length(results) + 1]] <- data.frame(
-          gene_id    = gene,
-          gene_symbol= gene_name,
+          gene_id       = gene,
+          gene_symbol   = gene_name,
           smoking_group = as.character(smoking),
-          HR         = round(cox$coefficients[,"exp(coef)"], 3),
-          lower_CI   = round(cox$conf.int[,"lower .95"], 3),
-          upper_CI   = round(cox$conf.int[,"upper .95"], 3),
-          KM_pval    = signif(pval, 3),
-          Cox_pval   = signif(cox$coefficients[,"Pr(>|z|)"], 3)
+          HR            = round(cox$coefficients[, "exp(coef)"], 3),
+          lower_CI      = round(cox$conf.int[, "lower .95"], 3),
+          upper_CI      = round(cox$conf.int[, "upper .95"], 3),
+          KM_pval       = signif(pval, 3),
+          Cox_pval      = signif(cox$coefficients[, "Pr(>|z|)"], 3),
+          n             = nrow(sub_df)
         )
       } else {
         # Still record KM p-value if Cox fails
         results[[length(results) + 1]] <- data.frame(
-          gene_id    = gene,
-          gene_symbol= gene_name,
+          gene_id       = gene,
+          gene_symbol   = gene_name,
           smoking_group = as.character(smoking),
-          HR         = NA,
-          lower_CI   = NA,
-          upper_CI   = NA,
-          KM_pval    = signif(pval, 3),
-          Cox_pval   = NA
+          HR            = NA,
+          lower_CI      = NA,
+          upper_CI      = NA,
+          KM_pval       = signif(pval, 3),
+          Cox_pval      = NA,
+          n             = nrow(sub_df)
         )
       }
       
       # Save plot if required (all or only significant)
       if (save_all_plots || (!is.na(pval) && pval < 0.05)) {
-        plot_title <- str_wrap(paste0(gene_name, " in ", cancer_type, " - Smoking: ", smoking), width = 50)
+        # optional: title wrapping (use stringr if available)
+        title_txt <- paste0(gene_name, " in ", cancer_type, " - Smoking: ", smoking)
+        if (requireNamespace("stringr", quietly = TRUE)) {
+          title_txt <- stringr::str_wrap(title_txt, width = 50)
+        }
+        
         plot <- ggsurvplot(
           fit,
           data = sub_df,
           pval = TRUE,
-          title = plot_title,
+          title = title_txt,
           xlab = "Days",
           ylab = "Survival Probability"
         )
@@ -2687,7 +2911,8 @@ smoking_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_
   if (length(results) > 0) {
     results_df <- do.call(rbind, results)
     write.csv(results_df, paste0(cancer_type, "_smoking_stratified_survival_results_ALL.csv"), row.names = FALSE)
-    cat("Saved smoking-stratified survival results for", nrow(results_df), "gene/smoking group combinations in", cancer_type, "\n")
+    cat("Saved smoking-stratified survival results for", nrow(results_df),
+        "gene/smoking group combinations in", cancer_type, "\n")
   } else {
     cat("No valid smoking-stratified survival results for", cancer_type, "\n")
   }
@@ -2703,8 +2928,6 @@ smoking_stratified_survival_and_cox(
   expr_matrix = LUSC_expr,clinical_df = clinical_LUSC,top15_genes = top15_LUSC,
   master_gene_label = master_gene_label,cancer_type = "LUSC",save_all_plots = TRUE)
 
-
-
 # ------------------------ Stage-Based Analysis of lncRNAs ------------------------
 # Kruskal-Wallis test to identify DE lncRNAs significantly different by stage (I, II, III, IV)
 # Stage-Based Analysis of lncRNAs (Top 15) with Kruskal–Wallis tests
@@ -2717,36 +2940,53 @@ library(readr)   # Reading CSV files
 # Function: fix_sample_ids
 # Purpose: Convert expression column names to TCGA submitter_id format (TCGA-XX-XXXX)
 fix_sample_ids <- function(ids) {
-  sapply(ids, function(x) {
-    parts <- unlist(strsplit(x, split = "\\."))
-    parts <- parts[parts != ""]
-    if (length(parts) >= 3) paste(parts[1:3], collapse = "-") else NA
-  })
+  ids <- gsub("(_tumor|_normal)$", "", ids, ignore.case = TRUE)  # drop suffix if present
+  ids <- gsub("\\.", "-", ids)                                   # dots -> dashes
+  vapply(strsplit(ids, "-"), function(p) {
+    p <- p[p != ""]
+    if (length(p) >= 3) paste(p[1:3], collapse = "-") else NA_character_
+  }, character(1))
+}
+
+# Helper: normalize AJCC pathologic stage to "Stage I/II/III/IV" (drops sub-stages IA/IB, etc.)
+normalize_stage <- function(x) {
+  x <- as.character(x)
+  # pull the roman numeral after 'Stage' (case-insensitive), ignore trailing letters/numbers
+  roman <- toupper(sub(".*[Ss]tage\\s*([IVX]+).*", "\\1", x))
+  # keep only I/II/III/IV; everything else -> NA
+  roman[!roman %in% c("I","II","III","IV")] <- NA
+  out <- ifelse(is.na(roman), NA, paste("Stage", roman))
+  factor(out, levels = c("Stage I","Stage II","Stage III","Stage IV"))
 }
 
 # Function: stage_correlation_top15
 # Purpose: For each of the Top 15 lncRNAs, run a Kruskal–Wallis test across pathologic stages.
-# Inputs: expr_file,clinical_file, top15_genes,master_gene_label, cancer_type
+# Inputs: expr_file, clinical_file, top15_genes, master_gene_label, cancer_type
 stage_correlation_top15 <- function(expr_file, clinical_file, top15_genes, master_gene_label, cancer_type) {
   
   # Load expression data and clinical data
-  expr <- read.csv(expr_file, row.names = 1)
-  clinical <- read.csv(clinical_file)
+  expr <- read.csv(expr_file, row.names = 1, check.names = FALSE)
+  clinical <- read.csv(clinical_file, stringsAsFactors = FALSE)
   
-  # Standardize expression column names to TCGA format and align with clinical
+  # Standardize expression column names to TCGA format (TCGA-XX-XXXX)
   colnames(expr) <- fix_sample_ids(colnames(expr))
+  # Standardize clinical submitter_id to first 12 chars and same punctuation
+  clinical$submitter_id <- substr(gsub("\\.", "-", clinical$submitter_id), 1, 12)
   
   # Align expression and clinical samples (intersection ensures matched order later)
   shared_samples <- intersect(colnames(expr), clinical$submitter_id)
+  if (length(shared_samples) < 10) {
+    stop(paste0("[", cancer_type, "] Too few matched samples: ", length(shared_samples)))
+  }
   expr <- expr[, shared_samples, drop = FALSE]
-  clinical <- clinical[match(shared_samples, clinical$submitter_id), ]
+  clinical <- clinical[match(shared_samples, clinical$submitter_id), , drop = FALSE]
   
   # Normalize/clean AJCC stage labels into Stage I/II/III/IV (drop sub-stages like IA/IB)
-  clinical$stage_group <- gsub("^Stage\\s+([IV]+)[A-Z]*$", "Stage \\1", clinical$ajcc_pathologic_stage)
-  clinical$stage_group <- factor(clinical$stage_group, levels = c("Stage I","Stage II","Stage III","Stage IV"))
+  clinical$stage_group <- normalize_stage(clinical$ajcc_pathologic_stage)
   
   # Report sample counts per stage (useful sanity check)
-  print(table(clinical$stage_group))
+  message("[", cancer_type, "] samples per stage (including NA):")
+  print(table(clinical$stage_group, useNA = "ifany"))
   
   # Clean gene IDs: remove version suffix from Top 15 and rownames
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
@@ -2754,34 +2994,42 @@ stage_correlation_top15 <- function(expr_file, clinical_file, top15_genes, maste
   
   # For each gene, run Kruskal–Wallis across available stages (requires >= 2 groups present)
   results <- lapply(top15_genes_clean, function(gene) {
-    if (gene %in% rownames(expr)) {
-      expr_vals <- as.numeric(expr[gene, ])
-      stage_vals <- clinical$stage_group
-      
-      # Only proceed if at least two stages are represented
-      if (length(unique(na.omit(stage_vals))) >= 2) {
-        test <- kruskal.test(expr_vals ~ stage_vals)
-        
-        # Compute absolute difference between max and min stage medians (effect size proxy)
-        group_medians <- tapply(expr_vals, stage_vals, median, na.rm = TRUE)
-        abs_median_diff <- abs(max(group_medians, na.rm = TRUE) - min(group_medians, na.rm = TRUE))
-        
-        # Map to gene symbol if available, else keep Ensembl ID
-        gene_symbol <- ifelse(
-          is.na(master_gene_label[gene]) | master_gene_label[gene] == "",
-          gene,
-          master_gene_label[gene]
-        )
-        
-        return(data.frame(
-          gene_id = gene,
-          gene_symbol = gene_symbol,
-          p_value = test$p.value,
-          abs_median_diff = abs_median_diff
-        ))
-      }
+    if (!gene %in% rownames(expr)) {
+      message("Gene not found in expression matrix: ", gene)
+      return(NULL)
     }
-    return(NULL)
+    
+    # pairwise-complete: drop rows with NA stage or NA expression
+    expr_vals  <- as.numeric(expr[gene, ])
+    stage_vals <- clinical$stage_group
+    ok <- !is.na(expr_vals) & !is.na(stage_vals)
+    expr_vals  <- expr_vals[ok]
+    stage_vals <- droplevels(stage_vals[ok])
+    
+    # Only proceed if at least two stages are represented
+    if (length(unique(stage_vals)) < 2) return(NULL)
+    
+    # Kruskal–Wallis test
+    test <- kruskal.test(expr_vals ~ stage_vals)
+    
+    # Compute absolute difference between max and min stage medians (effect size proxy)
+    group_medians <- tapply(expr_vals, stage_vals, median, na.rm = TRUE)
+    abs_median_diff <- abs(max(group_medians, na.rm = TRUE) - min(group_medians, na.rm = TRUE))
+    
+    # Map to gene symbol if available, else keep Ensembl ID
+    gene_symbol <- ifelse(
+      is.na(master_gene_label[gene]) | master_gene_label[gene] == "",
+      gene,
+      master_gene_label[gene]
+    )
+    
+    data.frame(
+      gene_id         = gene,
+      gene_symbol     = gene_symbol,
+      p_value         = unname(test$p.value),
+      abs_median_diff = unname(abs_median_diff),
+      n_total         = length(expr_vals)
+    )
   })
   
   # Combine results across genes
@@ -2800,13 +3048,13 @@ stage_correlation_top15 <- function(expr_file, clinical_file, top15_genes, maste
   write.csv(results_df, paste0(cancer_type, "_stage_correlation_top15_all.csv"), row.names = FALSE)
   write.csv(results_df[results_df$padj < 0.05, ], paste0(cancer_type, "_stage_correlation_top15_significant.csv"), row.names = FALSE)
   
-  cat("Done with", cancer_type, "- Top 15 stage correlation:", sum(results_df$padj < 0.05), "significant genes\n")
+  cat("Done with", cancer_type, "- Top 15 stage correlation:",
+      sum(results_df$padj < 0.05), "significant genes\n")
 }
 
 # Example calls
 stage_correlation_top15("LUAD_expr_matched.csv", "clinical_LUAD_clean.csv", top15_LUAD, master_gene_label, "LUAD")
 stage_correlation_top15("LUSC_expr_matched.csv", "clinical_LUSC_clean.csv", top15_LUSC, master_gene_label, "LUSC")
-
 
 #=============Plot stage-wise correlation
 # Plot Top 15 lncRNAs by Pathologic Stage (boxplots + pairwise Wilcoxon)
@@ -2821,11 +3069,34 @@ library(dplyr)    # Data manipulation
 # Function: fix_sample_ids
 # Purpose: Convert expression column names to TCGA submitter_id format (TCGA-XX-XXXX)
 fix_sample_ids <- function(ids) {
-  sapply(ids, function(x) {
-    parts <- unlist(strsplit(x, split = "\\."))
-    parts <- parts[parts != ""]
-    if (length(parts) >= 3) paste(parts[1:3], collapse = "-") else NA
-  })
+  ids <- gsub("(_tumor|_normal)$", "", ids, ignore.case = TRUE)  # drop suffix if present
+  ids <- gsub("\\.", "-", ids)                                   # dots -> dashes
+  vapply(strsplit(ids, "-"), function(p) {
+    p <- p[p != ""]
+    if (length(p) >= 3) paste(p[1:3], collapse = "-") else NA_character_
+  }, character(1))
+}
+
+# Helper: collapse duplicate columns (same submitter_id) by mean
+collapse_dupes_by_mean <- function(mat) {
+  ids <- colnames(mat)
+  idx <- split(seq_along(ids), ids)
+  out <- lapply(idx, function(j)
+    if (length(j) == 1) as.numeric(mat[, j])
+    else rowMeans(as.matrix(mat[, j, drop = FALSE]), na.rm = TRUE)
+  )
+  out <- do.call(cbind, out)
+  colnames(out) <- names(idx); rownames(out) <- rownames(mat)
+  out
+}
+
+# normalize AJCC pathologic stage to "Stage I/II/III/IV" (drops IA/IB, etc.)
+normalize_stage <- function(x) {
+  x <- as.character(x)
+  roman <- toupper(sub(".*[Ss]tage\\s*([IVX]+).*", "\\1", x))
+  roman[!roman %in% c("I","II","III","IV")] <- NA
+  out <- ifelse(is.na(roman), NA, paste("Stage", roman))
+  factor(out, levels = c("Stage I","Stage II","Stage III","Stage IV"))
 }
 
 # Function: plot_top_stage_genes_top15
@@ -2833,20 +3104,34 @@ fix_sample_ids <- function(ids) {
 plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, master_gene_label, cancer_type) {
   
   # Load expression data and clinical metadata
-  expr <- read.csv(expr_file, row.names = 1)
-  clinical <- read.csv(clinical_file)
+  expr <- read.csv(expr_file, row.names = 1, check.names = FALSE)
+  clinical <- read.csv(clinical_file, stringsAsFactors = FALSE)
+  
+  #keep tumor-only columns if the file contains both tumor/normal ---
+  tumor_cols <- grep("_tumor$", colnames(expr), value = TRUE, ignore.case = TRUE)
+  if (length(tumor_cols) > 0) {
+    expr <- expr[, tumor_cols, drop = FALSE]
+  }
   
   # Standardize expression column names to TCGA format and match to clinical
   colnames(expr) <- fix_sample_ids(colnames(expr))
+  expr <- expr[, !is.na(colnames(expr)), drop = FALSE]
+  # Collapse duplicate submitter IDs (replicates) by mean
+  expr <- collapse_dupes_by_mean(expr)
+  
+  # Clinical IDs: ensure same 12-char submitter_id format
+  clinical$submitter_id <- substr(gsub("\\.", "-", clinical$submitter_id), 1, 12)
   
   # Normalize/clean AJCC stage labels into Stage I/II/III/IV
-  clinical$stage_group <- gsub("^Stage\\s+([IV]+)[A-Z]*$", "Stage \\1", clinical$ajcc_pathologic_stage)
-  clinical$stage_group <- factor(clinical$stage_group, levels = c("Stage I","Stage II","Stage III","Stage IV"))
+  clinical$stage_group <- normalize_stage(clinical$ajcc_pathologic_stage)
   
   # Align on shared samples (keeps order consistent in both)
   common_samples <- intersect(colnames(expr), clinical$submitter_id)
+  if (length(common_samples) < 10) {
+    stop(paste0("[", cancer_type, "] Too few matched tumor samples: ", length(common_samples)))
+  }
   expr <- expr[, common_samples, drop = FALSE]
-  clinical <- clinical[match(common_samples, clinical$submitter_id), ]
+  clinical <- clinical[match(common_samples, clinical$submitter_id), , drop = FALSE]
   
   # Clean gene IDs (remove version numbers from Top 15 and rownames)
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
@@ -2856,26 +3141,23 @@ plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, ma
   for (gene in top15_genes_clean) {
     
     if (gene %in% rownames(expr)) {
-      
       # Build plotting dataframe: expression + stage_group
       expr_vec <- as.numeric(expr[gene, ])
       df <- data.frame(
         expression = expr_vec,
         stage_group = clinical$stage_group
       )
-      
-      # Drop samples without stage info
-      df <- df[!is.na(df$stage_group), ]
-      
+      # Drop samples without stage info or expression
+      df <- df[!is.na(df$stage_group) & !is.na(df$expression), , drop = FALSE]
       # Skip plotting if fewer than 2 distinct stages remain
-      if (length(unique(df$stage_group)) < 2) next
+      if (nrow(df) < 6 || length(unique(df$stage_group)) < 2) next
       
       # Sample sizes and label positions per stage (for n annotations)
-      df %>%
+      label_df <- df %>%
         group_by(stage_group) %>%
-        summarise(n = n(), y = max(expression, na.rm = TRUE) * 1.15, .groups = "drop") -> label_df
+        summarise(n = n(), y = max(expression, na.rm = TRUE) * 1.12, .groups = "drop")
       
-      # Define pairwise comparisons among stages
+      # Define pairwise comparisons among stages; keep only present pairs
       all_comparisons <- list(
         c("Stage I", "Stage II"),
         c("Stage I", "Stage III"),
@@ -2884,7 +3166,6 @@ plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, ma
         c("Stage II", "Stage IV"),
         c("Stage III", "Stage IV")
       )
-      # Keep only pairs that are present in this dataset
       present_levels <- levels(droplevels(df$stage_group))
       comparisons_list <- Filter(function(x) all(x %in% present_levels), all_comparisons)
       
@@ -2914,10 +3195,10 @@ plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, ma
           inherit.aes = FALSE, size = 5.5, color = "black"
         ) +
         scale_fill_manual(values = c(
-          "Stage I" = "red",
-          "Stage II" = "grey",
+          "Stage I"   = "red",
+          "Stage II"  = "grey",
           "Stage III" = "#A80000",
-          "Stage IV" = "#D62728"
+          "Stage IV"  = "#D62728"
         )) +
         labs(
           title = paste(gene_symbol, "expression by stage in", cancer_type),
@@ -2926,11 +3207,11 @@ plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, ma
         ) +
         theme_minimal(base_size = 14) +
         theme(
-          axis.text = element_text(size = 14),
+          axis.text  = element_text(size = 14),
           axis.title = element_text(size = 16),
-          legend.text = element_text(size = 12),
+          legend.text  = element_text(size = 12),
           legend.title = element_text(size = 14),
-          plot.title = element_text(size = 18, face = "bold")
+          plot.title   = element_text(size = 18, face = "bold")
         )
       
       # Save plot to disk (one PNG per gene)
@@ -2938,8 +3219,8 @@ plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, ma
         filename = paste0(cancer_type, "_", gene_symbol, "_stage_boxplot_top15.png"),
         plot = p, width = 6, height = 5, dpi = 300
       )
-      
       cat("Saved plot for gene:", gene_symbol, "\n")
+      
     } else {
       cat("Gene not found in expression matrix:", gene, "\n")
     }
@@ -2950,12 +3231,14 @@ plot_top_stage_genes_top15 <- function(expr_file, clinical_file, top15_genes, ma
 
 # Example calls
 plot_top_stage_genes_top15(
-  expr_file = "LUAD_lncRNA_log_trans_after_norm.csv",clinical_file = "clinical_LUAD_clean.csv",
-  top15_genes = top15_LUAD,master_gene_label = master_gene_label,cancer_type = "LUAD")
+  expr_file = "LUAD_lncRNA_log_trans_after_norm.csv", clinical_file = "clinical_LUAD_clean.csv",
+  top15_genes = top15_LUAD, master_gene_label = master_gene_label, cancer_type = "LUAD"
+)
 
 plot_top_stage_genes_top15(
-  expr_file = "LUSC_lncRNA_log_trans_after_norm.csv",clinical_file = "clinical_LUSC_clean.csv",
-  top15_genes = top15_LUSC,master_gene_label = master_gene_label,cancer_type = "LUSC")
+  expr_file = "LUSC_lncRNA_log_trans_after_norm.csv", clinical_file = "clinical_LUSC_clean.csv",
+  top15_genes = top15_LUSC, master_gene_label = master_gene_label, cancer_type = "LUSC"
+)
 
 
 # ------------------------ Stage-Based Survival Analysis of lncRNAs ------------------------
@@ -2966,21 +3249,47 @@ library(survminer)   # For visualization of survival curves with ggplot2
 library(dplyr)       # For data manipulation
 library(stringr)     # For safe plot titles / filenames
 
+#Load datasets
+LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1, check.names = FALSE)
+LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1, check.names = FALSE)
+
+clinical_LUAD <- readr::read_csv("clinical_LUAD_clean.csv", show_col_types = FALSE)
+clinical_LUSC <- readr::read_csv("clinical_LUSC_clean.csv", show_col_types = FALSE)
+
 # This function:
 # Takes the top 15 lncRNAs for a given cancer type
 # For each gene, splits patients by AJCC pathologic stage (I–IV)
 # Within each stage, separates samples into "High" and "Low" expression groups (median split)
 # Runs Kaplan–Meier survival analysis and log-rank test and Cox proportional hazards regression to calculate hazard ratios (HR) and confidence intervals (CI)
-stage_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes, master_gene_label, cancer_type, save_all_plots = TRUE) {
+
+stage_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_genes,
+                                              master_gene_label, cancer_type,
+                                              save_all_plots = TRUE) {
   
   # Initialize empty list to store results
   results <- list()
   
-  # Preprocessing
   # Remove version numbers from Ensembl IDs in Top 15 list (e.g., ENSG000001.1 -> ENSG000001)
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   # Remove version numbers from expression matrix rownames
   rownames(expr_matrix) <- gsub("\\..*", "", rownames(expr_matrix))
+  
+  # IMPORTANT: harmonize IDs & match samples before any analysis
+  # clinical submitter_id -> first 12 chars (TCGA-XX-XXXX); also normalize dots to dashes
+  clin_ids <- substr(gsub("\\.", "-", clinical_df$submitter_id), 1, 12)
+  # we assume expr_matrix columns are already TCGA-XX-XXXX (from your *_expr_matched.csv files)
+  use_ids <- intersect(colnames(expr_matrix), clin_ids)
+  if (length(use_ids) < 10) {
+    stop(paste0("[", cancer_type, "] Too few matched samples after alignment: ", length(use_ids)))
+  }
+  # align order in both objects
+  expr_matrix <- expr_matrix[, use_ids, drop = FALSE]
+  clinical_df <- clinical_df[match(use_ids, clin_ids), , drop = FALSE]
+  
+  # Sanity check
+  if (ncol(expr_matrix) != nrow(clinical_df)) {
+    stop("Internal matching error: ncol(expr_matrix) != nrow(clinical_df)")
+  }
   
   # Ensure survival columns exist
   # If 'overall_survival' and 'deceased' columns are missing, try creating them from available clinical data
@@ -3000,14 +3309,22 @@ stage_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_ge
       as.numeric(clinical_df$days_to_last_follow_up)
     )
   }
+  # Make sure survival columns are numeric
+  clinical_df$overall_survival <- as.numeric(clinical_df$overall_survival)
+  clinical_df$deceased         <- as.numeric(clinical_df$deceased)
   
   # Standardize stage labels
   # Convert stage values to a clean, consistent format: Stage I, Stage II, Stage III, Stage IV
-  clinical_df$stage_group <- gsub("^Stage\\s+([IV]+)[A-Z]*$", "Stage \\1", clinical_df$ajcc_pathologic_stage)
-  # Ensure proper ordering of factor levels
-  clinical_df$stage_group <- factor(clinical_df$stage_group, levels = c("Stage I","Stage II","Stage III","Stage IV"))
+  normalize_stage <- function(x) {
+    x <- as.character(x)
+    roman <- toupper(sub(".*[Ss]tage\\s*([IVX]+).*", "\\1", x))
+    roman[!roman %in% c("I","II","III","IV")] <- NA
+    out <- ifelse(is.na(roman), NA, paste("Stage", roman))
+    factor(out, levels = c("Stage I","Stage II","Stage III","Stage IV"))
+  }
+  clinical_df$stage_group <- normalize_stage(clinical_df$ajcc_pathologic_stage)
   
-  # Main loop over genes
+  #For each gene in the Top 15, run survival analysis within each stage
   for (gene in top15_genes_clean) {
     
     # Skip if gene is missing from expression matrix
@@ -3023,25 +3340,26 @@ stage_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_ge
       master_gene_label[gene]
     )
     
-    # Merge clinical and expression data
+    # Merge clinical and expression data (ordering already aligned)
     df <- clinical_df
-    df$expression <- as.numeric(expr_matrix[gene, ])
+    df$expression <- as.numeric(expr_matrix[gene, use_ids])
     
     # Remove rows with missing data in expression, survival, or stage
-    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased) & !is.na(df$stage_group), ]
+    df <- df[!is.na(df$expression) & !is.na(df$overall_survival) & !is.na(df$deceased) & !is.na(df$stage_group), ,
+             drop = FALSE]
     
     # Skip if too few samples overall
     if (nrow(df) < 10) next
     
-    # Loop over stages
-    for (stg in unique(df$stage_group)) {
-      
-      # Filter samples for this stage
-      sub_df <- df[df$stage_group == stg, ]
-      if (nrow(sub_df) < 10) next  # Skip if too few samples
+    #WITHIN-STAGE ANALYSES
+    # Loop over stages actually present
+    for (stg in levels(droplevels(df$stage_group))) {
+      sub_df <- df[df$stage_group == stg, , drop = FALSE]
+      if (nrow(sub_df) < 10) next  # Skip if too few samples in this stage
       
       # Median split into High and Low expression groups (within stage)
       sub_df$group <- ifelse(sub_df$expression >= median(sub_df$expression, na.rm = TRUE), "High", "Low")
+      sub_df$group <- factor(sub_df$group, levels = c("Low","High"))  # set reference to "Low"
       
       # Skip if only one expression group present
       if (length(unique(sub_df$group)) < 2) next
@@ -3054,63 +3372,58 @@ stage_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_ge
       pval <- 1 - pchisq(test$chisq, df = 1)
       
       # Cox proportional hazards regression
-      cox <- tryCatch({
-        summary(coxph(Surv(overall_survival, deceased) ~ group, data = sub_df))
-      }, error = function(e) NULL)
+      cox <- tryCatch(
+        summary(coxph(Surv(overall_survival, deceased) ~ group, data = sub_df)),
+        error = function(e) NULL
+      )
       
-      # Store results
+      # Store results (prefer Cox if available; still record KM p if not)
       if (!is.null(cox)) {
         results[[length(results) + 1]] <- data.frame(
-          gene_id     = gene,
-          gene_symbol = gene_name,
-          stage_group = as.character(stg),
-          HR          = round(cox$coefficients[,"exp(coef)"], 3),
-          lower_CI    = round(cox$conf.int[,"lower .95"], 3),
-          upper_CI    = round(cox$conf.int[,"upper .95"], 3),
-          KM_pval     = signif(pval, 3),
-          Cox_pval    = signif(cox$coefficients[,"Pr(>|z|)"], 3)
+          gene_id      = gene,
+          gene_symbol  = gene_name,
+          stage_group  = as.character(stg),
+          HR           = round(cox$coefficients[, "exp(coef)"], 3),
+          lower_CI     = round(cox$conf.int[, "lower .95"], 3),
+          upper_CI     = round(cox$conf.int[, "upper .95"], 3),
+          KM_pval      = signif(pval, 3),
+          Cox_pval     = signif(cox$coefficients[, "Pr(>|z|)"], 3),
+          n            = nrow(sub_df)
         )
       } else {
-        # Save at least KM p-value if Cox fails
         results[[length(results) + 1]] <- data.frame(
-          gene_id     = gene,
-          gene_symbol = gene_name,
-          stage_group = as.character(stg),
-          HR          = NA,
-          lower_CI    = NA,
-          upper_CI    = NA,
-          KM_pval     = signif(pval, 3),
-          Cox_pval    = NA
+          gene_id      = gene,
+          gene_symbol  = gene_name,
+          stage_group  = as.character(stg),
+          HR           = NA,
+          lower_CI     = NA,
+          upper_CI     = NA,
+          KM_pval      = signif(pval, 3),
+          Cox_pval     = NA,
+          n            = nrow(sub_df)
         )
       }
       
       # Save plot if required
       if (save_all_plots || (!is.na(pval) && pval < 0.05)) {
-        # Safe plot title wrapping
-        plot_title <- str_wrap(paste(gene_name, "in", cancer_type, "- Stage", stg), width = 50)
-        
-        # Generate Kaplan–Meier plot
         plot <- ggsurvplot(
           fit,
           data = sub_df,
           pval = TRUE,
-          title = plot_title,
+          title = paste(gene_name, "in", cancer_type, "-", stg),
           xlab = "Days",
           ylab = "Survival Probability"
         )
-        
-        # Safe filename for saving
+        # Safe filename
         safe_stage <- gsub("[^A-Za-z0-9]+", "_", as.character(stg))
         filename <- paste0(cancer_type, "_", gene_name, "_Stage_", safe_stage, "_survival.png")
-        
-        # Save plot to PNG
         ggsave(filename, plot = plot$plot, width = 6, height = 5, dpi = 300)
-        cat("Saved survival plot for:", gene_name, "- Stage", as.character(stg), "\n")
+        cat("Saved survival plot for:", gene_name, "-", stg, "\n")
       }
     }
   }
   
-  # Export combined results
+  #EXPORT
   if (length(results) > 0) {
     results_df <- do.call(rbind, results)
     write.csv(results_df, paste0(cancer_type, "_stage_stratified_survival_results_ALL.csv"), row.names = FALSE)
@@ -3119,6 +3432,7 @@ stage_stratified_survival_and_cox <- function(expr_matrix, clinical_df, top15_ge
     cat("No valid stage-stratified survival results for", cancer_type, "\n")
   }
 }
+
 
 # Apply function to LUAD
 stage_stratified_survival_and_cox(
@@ -3132,7 +3446,6 @@ stage_stratified_survival_and_cox(
 
 
 
-
 #---------------------------- Multivariate Cox Regression ----------------------
 # Multivariate Cox Regression for Top 15 lncRNAs (adjusting for age, gender, smoking, stage)
 # Load required libraries
@@ -3143,6 +3456,13 @@ library(stringr)   # String utilities (pattern matching)
 library(forcats)   # Factor handling (if needed later)
 
 
+#Load datasets
+LUAD_expr <- read.csv("LUAD_expr_matched.csv", row.names = 1, check.names = FALSE)
+LUSC_expr <- read.csv("LUSC_expr_matched.csv", row.names = 1, check.names = FALSE)
+
+clinical_LUAD <- readr::read_csv("clinical_LUAD_clean.csv", show_col_types = FALSE)
+clinical_LUSC <- readr::read_csv("clinical_LUSC_clean.csv", show_col_types = FALSE)
+
 #Helper: standardize expression column sample IDs to TCGA submitter_id format
 # - Replace dots with dashes
 # - Keep the first 12 characters (TCGA-XX-XXXX)
@@ -3152,54 +3472,67 @@ fix_sample_ids <- function(ids) {
   return(ids)
 }
 
-
-
 # Multivariate Cox regression function
 #Inputs: expr_file, clinical_file, top15_genes, master_gene_label, cancer_type
 run_multivariate_cox <- function(expr_file, clinical_file, top15_genes, master_gene_label, cancer_type) {
   # Load expression and clinical data
   expr <- read.csv(expr_file, row.names = 1, check.names = FALSE)
-  clinical <- read.csv(clinical_file)
+  clinical <- read.csv(clinical_file, stringsAsFactors = FALSE)
   
   # Clean IDs
   #Expression colnames match TCGA submitter_id format
-  colnames(expr) <- fix_sample_ids(colnames(expr))
+  # (robust: handle both already-matched IDs and raw IDs with dots)
+  expr_ids <- gsub("\\.", "-", colnames(expr))
+  expr_ids <- vapply(strsplit(expr_ids, "-"), function(p) {
+    if (length(p) >= 3) paste(p[1:3], collapse = "-") else NA_character_
+  }, character(1))
+  colnames(expr) <- expr_ids
+  
   #Drop version numbers from gene IDs in expression matrix
   rownames(expr) <- gsub("\\..*", "", rownames(expr))
   # Clean Top 15 gene IDs (remove version numbers)
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   
   # Align samples present in both expression and clinical data and keeps ordering consistent
+  clinical$submitter_id <- substr(gsub("\\.", "-", as.character(clinical$submitter_id)), 1, 12)
   common_samples <- intersect(colnames(expr), clinical$submitter_id)
   expr <- expr[, common_samples, drop = FALSE]
-  clinical <- clinical[match(common_samples, clinical$submitter_id), ]
+  clinical <- clinical[match(common_samples, clinical$submitter_id), , drop = FALSE]
   
+  # Bail out early if too few samples
+  if (length(common_samples) < 20) {
+    message("[", cancer_type, "] Too few matched samples for multivariate Cox: ", length(common_samples))
+    return(invisible(NULL))
+  }
   
   # Build/clean clinical covariates required for the multivariable model
   # - Convert age to years
   # - Set factors for gender, smoking group, and stage
   # - Create survival time and event indicator
-  clinical <- clinical %>%
-    mutate(
+  suppressWarnings({
+    clinical <- dplyr::mutate(
+      clinical,
       age = as.numeric(age_at_diagnosis) / 365,  # Age in years
-      gender = as.factor(gender),                # Ensure categorical
+      gender = factor(gender),                   # Ensure categorical
       # Collapse detailed smoking into 3 groups
-      smoking_group = case_when(
+      smoking_group = dplyr::case_when(
         tobacco_smoking_status == "Lifelong Non-Smoker" ~ "Never smoker",
-        str_detect(tobacco_smoking_status, "Reformed")  ~ "Ex-smoker",
-        tobacco_smoking_status == "Current Smoker"      ~ "Current smoker",
+        grepl("Reformed", tobacco_smoking_status %||% "", ignore.case = TRUE) ~ "Ex-smoker",
+        tobacco_smoking_status == "Current Smoker" ~ "Current smoker",
         TRUE ~ NA_character_
       ),
-      smoking_group = factor(smoking_group),
+      smoking_group = factor(smoking_group, levels = c("Never smoker","Ex-smoker","Current smoker")),
       # Normalize AJCC pathologic stage to Stage I/II/III/IV
-      stage_group = gsub("^Stage\\s+([IV]+)[A-Z]*$", "Stage \\1", ajcc_pathologic_stage),
-      stage_group = factor(stage_group),
+      stage_group = gsub("^Stage\\s*([IV]+)[A-Z]?$", "Stage \\1", ajcc_pathologic_stage %||% ""),
+      stage_group = factor(stage_group, levels = c("Stage I","Stage II","Stage III","Stage IV")),
       # Survival outcome: event and time (in days)
       deceased = as.numeric(vital_status != "Alive"),
       overall_survival = ifelse(
-        deceased == 1, as.numeric(days_to_death), as.numeric(days_to_last_follow_up)
+        deceased == 1, suppressWarnings(as.numeric(days_to_death)),
+        suppressWarnings(as.numeric(days_to_last_follow_up))
       )
     )
+  })
   
   # Container for per-gene Cox summaries
   results_list <- list()
@@ -3216,16 +3549,17 @@ run_multivariate_cox <- function(expr_file, clinical_file, top15_genes, master_g
     clinical$expression <- as.numeric(expr[gene, ])
     
     # Keep only complete cases across all required variables
-    df <- clinical %>%
-      filter(
-        !is.na(expression),
-        !is.na(age),
-        !is.na(gender),
-        !is.na(smoking_group),
-        !is.na(stage_group),
-        !is.na(overall_survival),
-        !is.na(deceased)
-      )
+    df <- dplyr::filter(
+      clinical,
+      !is.na(expression),
+      !is.na(age),
+      !is.na(gender),
+      !is.na(smoking_group),
+      !is.na(stage_group),
+      !is.na(overall_survival),
+      !is.na(deceased)
+    )
+    df <- droplevels(df)
     
     cat(" Gene:", gene, "- Valid samples:", nrow(df), "\n")
     
@@ -3239,7 +3573,9 @@ run_multivariate_cox <- function(expr_file, clinical_file, top15_genes, master_g
     # Surv(time, event) ~ expression + age + gender + smoking_group + stage_group
     # - expression is the effect of interest adjusted for covariates
     cox_model <- tryCatch({
-      coxph(Surv(overall_survival, deceased) ~ expression + age + gender + smoking_group + stage_group, data = df)
+      survival::coxph(survival::Surv(overall_survival, deceased) ~
+                        expression + age + gender + smoking_group + stage_group,
+                      data = df)
     }, error = function(e) {
       message("Failed model for gene: ", gene, " - ", e$message)
       return(NULL)
@@ -3263,12 +3599,12 @@ run_multivariate_cox <- function(expr_file, clinical_file, top15_genes, master_g
   
   # If any gene succeeded, bind and write results
   if (length(results_list) > 0) {
-    all_results <- bind_rows(results_list)
+    all_results <- dplyr::bind_rows(results_list)
     
     # Focus summary on the expression effect for per-gene significance reporting
     expression_rows <- all_results %>%
-      filter(variable == "expression") %>%
-      mutate(
+      dplyr::filter(variable == "expression") %>%
+      dplyr::mutate(
         HR = exp(coef),                                           # hazard ratio for expression
         lower_CI = exp(coef - 1.96 * `se(coef)`),                 # Wald 95% CI lower
         upper_CI = exp(coef + 1.96 * `se(coef)`),                 # Wald 95% CI upper
@@ -3289,6 +3625,7 @@ run_multivariate_cox <- function(expr_file, clinical_file, top15_genes, master_g
     }
   }
 }
+
 
 # Run for LUAD and LUSC
 run_multivariate_cox("LUAD_expr_matched.csv", "clinical_LUAD_clean.csv", top15_LUAD, master_gene_label, "LUAD")
@@ -3381,6 +3718,7 @@ p <- ggplot(combined_df, aes(x = HR, y = gene_display, color = significance)) +
 ggsave("multivariate_forest_plot_FIXED.png", plot = p, width = 10, height = 10, dpi = 300)
 
 
+
 #----------------- Evaluate 2- and 3-gene lncRNA signatures for survival -------
 
 # Evaluate 2- and 3-gene lncRNA signatures for survival (using precomputed OS/event)
@@ -3407,6 +3745,9 @@ prepare_survival_df_precomputed <- function(expr_file, clin_file) {
   expr <- read.csv(expr_file, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
   clin <- read_csv(clin_file, show_col_types = FALSE)
   
+  # Strip version numbers from Ensembl IDs so column names (after transpose) are clean
+  rownames(expr) <- gsub("\\..*", "", rownames(expr))
+  
   # Basic checks for required columns
   required_cols <- c("submitter_id", "overall_survival", "deceased")
   if (!all(required_cols %in% colnames(clin))) {
@@ -3416,6 +3757,8 @@ prepare_survival_df_precomputed <- function(expr_file, clin_file) {
   # Clean expression column IDs and match to clinical
   colnames(expr) <- fix_sample_ids(colnames(expr))
   
+  # Normalize clinical submitter IDs to 12 chars (safety)
+  clin$submitter_id     <- substr(as.character(clin$submitter_id), 1, 12)
   # Ensure numeric survival/time columns
   clin$overall_survival <- as.numeric(clin$overall_survival)
   clin$deceased         <- as.numeric(clin$deceased)
@@ -3447,12 +3790,13 @@ df_LUSC <- prepare_survival_df_precomputed("LUSC_expr_matched.csv", "clinical_LU
 # Fit a Cox model for one signature (2 or 3 genes) and return summary metrics
 evaluate_signature <- function(df, genes) {
   # Ensure genes are in the dataframe
+  if (!all(genes %in% colnames(df))) return(NULL)
   subdf <- df[, c(genes, "overall_survival", "deceased"), drop = FALSE]
   subdf <- na.omit(subdf)
   
   # Skip if too few patients, no events, or a gene has zero variance
   if (nrow(subdf) < 20 || length(unique(subdf$deceased)) < 2) return(NULL)
-  if (any(sapply(subdf[, genes, drop = FALSE], sd) == 0))    return(NULL)
+  if (any(sapply(subdf[, genes, drop = FALSE], sd, na.rm = TRUE) == 0)) return(NULL)
   
   # Build Cox formula: Surv ~ geneA + geneB (+ geneC)
   form <- as.formula(
@@ -3465,12 +3809,20 @@ evaluate_signature <- function(df, genes) {
   
   #Extract C-index, AIC, logLIK and global wald p-value
   sum_fit <- summary(fit)
-  wald_p  <- sum_fit$waldtest["pvalue"]   # global Wald p-value for the signature
+  # robust pick of global Wald p-value
+  wald_vec <- as.numeric(sum_fit$waldtest)
+  wald_p   <- if (!is.null(names(sum_fit$waldtest)) && "pvalue" %in% names(sum_fit$waldtest)) {
+    as.numeric(sum_fit$waldtest["pvalue"])
+  } else if (length(wald_vec) >= 3) {
+    wald_vec[3]
+  } else {
+    NA_real_
+  }
   
   data.frame(
     signature = paste(genes, collapse = " + "),
-    C_index   = sum_fit$concordance[1],
-    AIC       = AIC(fit),
+    C_index   = as.numeric(sum_fit$concordance[1]),
+    AIC       = as.numeric(AIC(fit)),
     logLik    = as.numeric(logLik(fit)),
     p_value   = as.numeric(wald_p),
     stringsAsFactors = FALSE
@@ -3479,12 +3831,15 @@ evaluate_signature <- function(df, genes) {
 
 # Evaluate all 2- and 3-gene combinations from a candidate list
 evaluate_all_combinations <- function(df, top_genes) {
-  # Generate pairs and triples
+  # Guard against too-short lists
+  if (length(top_genes) < 2) stop("Need at least 2 genes to form a signature.")
   pairs   <- combn(top_genes, 2, simplify = FALSE)
-  triples <- combn(top_genes, 3, simplify = FALSE)
+  triples <- if (length(top_genes) >= 3) combn(top_genes, 3, simplify = FALSE) else list()
   
   # Fit and collect metrics
-  results <- do.call(rbind, lapply(c(pairs, triples), function(g) evaluate_signature(df, g)))
+  all_sets <- c(pairs, triples)
+  res_list <- lapply(all_sets, function(g) evaluate_signature(df, g))
+  results  <- do.call(rbind, res_list[!sapply(res_list, is.null)])
   
   if (is.null(results) || nrow(results) == 0) {
     stop("No valid combinations found; adjust filters or sample size.")
@@ -3500,8 +3855,11 @@ evaluate_all_combinations <- function(df, top_genes) {
 }
 
 # Read Top-15 list and keep only genes present in df
-top15_LUAD_in_df <- intersect(top15_LUAD, colnames(df_LUAD))
-top15_LUSC_in_df <- intersect(top15_LUSC, colnames(df_LUSC))
+# (strip versions so names line up with df, which uses version-less Ensembl IDs)
+top15_LUAD_clean <- gsub("\\..*", "", top15_LUAD)
+top15_LUSC_clean <- gsub("\\..*", "", top15_LUSC)
+top15_LUAD_in_df <- intersect(top15_LUAD_clean, colnames(df_LUAD))
+top15_LUSC_in_df <- intersect(top15_LUSC_clean, colnames(df_LUSC))
 
 # Rank all 2- and 3-gene signatures
 ranked_LUAD <- evaluate_all_combinations(df_LUAD, top15_LUAD_in_df)
@@ -3511,24 +3869,32 @@ ranked_LUSC <- evaluate_all_combinations(df_LUSC, top15_LUSC_in_df)
 # Risk score = Cox linear predictor; split by median into High/Low risk groups
 get_km_pval <- function(df, signature) {
   genes <- strsplit(signature, " + ", fixed = TRUE)[[1]]
+  if (!all(genes %in% colnames(df))) return(1)
+  
+  subdf <- df[, c(genes, "overall_survival", "deceased"), drop = FALSE]
+  subdf <- na.omit(subdf)
+  if (nrow(subdf) < 10 || length(unique(subdf$deceased)) < 2) return(1)
   
   form <- as.formula(
     sprintf("Surv(overall_survival, deceased) ~ %s",
             paste(sprintf("`%s`", genes), collapse = " + "))
   )
-  fit <- tryCatch(coxph(form, data = df), error = function(e) NULL)
+  fit <- tryCatch(coxph(form, data = subdf), error = function(e) NULL)
   if (is.null(fit)) return(1)
   
   #Splits into High/Low by the median risk score
-  risk <- predict(fit, newdata = df, type = "lp")
-  df$risk_group <- factor(risk >= median(risk, na.rm = TRUE), labels = c("Low", "High"))
+  risk <- predict(fit, newdata = subdf, type = "lp")
+  if (all(is.na(risk)) || sd(risk, na.rm = TRUE) == 0) return(1)
+  subdf$risk_group <- factor(risk >= median(risk, na.rm = TRUE), labels = c("Low", "High"))
+  if (length(unique(subdf$risk_group)) < 2) return(1)
   
-  sdiff <- survdiff(Surv(overall_survival, deceased) ~ risk_group, data = df)
+  sdiff <- tryCatch(survdiff(Surv(overall_survival, deceased) ~ risk_group, data = subdf),
+                    error = function(e) NULL)
+  if (is.null(sdiff)) return(1)
   pval  <- 1 - pchisq(sdiff$chisq, length(sdiff$n) - 1)
-  return(pval)
+  if (is.na(pval)) pval <- 1
+  pval
 }
-
-
 
 # Compute KM p-values for each signature’s High/Low risk split
 ranked_LUAD$km_pval <- sapply(ranked_LUAD$signature, function(sig) get_km_pval(df_LUAD, sig))
@@ -3537,7 +3903,9 @@ ranked_LUSC$km_pval <- sapply(ranked_LUSC$signature, function(sig) get_km_pval(d
 
 # Plot and save KM curves for significant signatures
 plot_top_signatures <- function(df, ranked, master_gene_label, prefix, top_n = 5) {
-  for (i in seq_len(min(top_n, nrow(ranked)))) {
+  if (nrow(ranked) == 0) return(invisible(NULL))
+  top_n <- min(top_n, nrow(ranked))
+  for (i in seq_len(top_n)) {
     genes <- strsplit(ranked$signature[i], " + ", fixed = TRUE)[[1]]
     
     # Map Ensembl IDs to symbols for a nicer title
@@ -3546,20 +3914,27 @@ plot_top_signatures <- function(df, ranked, master_gene_label, prefix, top_n = 5
       if (is.na(sym) || sym == "") g else sym
     })
     
+    subdf <- df[, c(genes, "overall_survival", "deceased"), drop = FALSE]
+    subdf <- na.omit(subdf)
+    if (nrow(subdf) < 10 || length(unique(subdf$deceased)) < 2) next
     
     form <- as.formula(
       sprintf("Surv(overall_survival, deceased) ~ %s",
               paste(sprintf("`%s`", genes), collapse = " + "))
     )
-    fit  <- coxph(form, data = df)
-    risk <- predict(fit, newdata = df, type = "lp")
-    df$risk_group <- factor(risk >= median(risk, na.rm = TRUE), labels = c("Low", "High"))
+    fit  <- tryCatch(coxph(form, data = subdf), error = function(e) NULL)
+    if (is.null(fit)) next
     
-    km <- survfit(Surv(overall_survival, deceased) ~ risk_group, data = df)
+    risk <- predict(fit, newdata = subdf, type = "lp")
+    if (all(is.na(risk)) || sd(risk, na.rm = TRUE) == 0) next
+    subdf$risk_group <- factor(risk >= median(risk, na.rm = TRUE), labels = c("Low", "High"))
+    if (length(unique(subdf$risk_group)) < 2) next
+    
+    km <- survfit(Surv(overall_survival, deceased) ~ risk_group, data = subdf)
     title <- sprintf("%s: %s", prefix, paste(gene_syms, collapse = ", "))
     
     plt <- ggsurvplot(
-      km, data = df,
+      km, data = subdf,
       pval       = TRUE,
       risk.table = FALSE,
       palette    = c("#F4A8A8", "#A80000"),
@@ -3579,8 +3954,6 @@ plot_top_signatures <- function(df, ranked, master_gene_label, prefix, top_n = 5
   }
 }
 
-
-
 # Save significant signatures and top 5 by KM p-value
 sig_LUAD <- subset(ranked_LUAD, km_pval < 0.05)
 sig_LUSC <- subset(ranked_LUSC, km_pval < 0.05)
@@ -3592,23 +3965,16 @@ sig_LUSC <- sig_LUSC[order(sig_LUSC$km_pval), ]
 write.csv(sig_LUAD, "LUAD_top_significant_by_KM_pval.csv", row.names = FALSE)
 write.csv(head(sig_LUAD, 5), "LUAD_top5_significant_by_KM_pval.csv", row.names = FALSE)
 
-
 write.csv(sig_LUSC, "LUSC_top_significant_by_KM_pval.csv", row.names = FALSE)
 write.csv(head(sig_LUSC, 5), "LUSC_top5_significant_by_KM_pval.csv", row.names= FALSE)
-
 
 # Plot significant signatures (KM curves)
 if (nrow(sig_LUAD) > 0) {
   plot_top_signatures(df_LUAD, sig_LUAD, master_gene_label, "LUAD")
 }
-
-
 if (nrow(sig_LUSC) > 0) {
   plot_top_signatures(df_LUSC, sig_LUSC, master_gene_label, "LUSC")
 }
-
-
-
 
 
 
@@ -4199,6 +4565,7 @@ run_one_cancer(
   top15_lnc_csv = "LUSC_top15_lncRNA_with_gene_names.csv",
   top15_mrna_csv= "LUSC_top15_mRNA_with_gene_names.csv"
 )
+
 
 
 
