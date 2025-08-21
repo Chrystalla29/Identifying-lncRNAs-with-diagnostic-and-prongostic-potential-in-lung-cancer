@@ -17,14 +17,36 @@ The project includes:
 ---
 
 ## PROJECT CONTENT
-- `data/`: Contains all CSV files for expression counts, differential expression, and survival summaries.
-- `research_project_code.R`: The main R script for the full bioinformatics pipeline.
-- `README.md`: You're here! The project overview and instructions.
+- `*.R` : Scripts for data preprocessing, differential expression analysis, survival analysis, and correlation between lncRNAs and mRNAs.
+- `sessionInfo.txt` : R environment details to reproduce the analysis.
+- `README.md` : Instructions and project overview.
 
 
 ## OBJECTIVE
 
 To identify and evaluate differentially expressed lncRNAs in LUAD and LUSC as potential diagnostic and prognostic biomarkers and explore their association with clinical outcomes.
+
+## DATA
+Raw RNA-seq and clinical data were downloaded from [TCGA](https://portal.gdc.cancer.gov/).  
+Data files are **not included** in this repository due to size limitations.  
+
+## ENVIRONMENT
+This project was developed in R version 4.4.2 (Windows 11).  
+All package versions are listed in [sessionInfo.txt](sessionInfo.txt).
+
+To reproduce the environment, install the required packages:
+```r
+# Example installation
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("SummarizedExperiment",
+                       "GenomicRanges",
+                       "TCGAbiolinks",
+                       "DESeq2",
+                       "survminer",
+                       "corrplot"))
+
 
 ## METHODS OVERVIEW
 
