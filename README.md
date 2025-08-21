@@ -46,8 +46,7 @@ BiocManager::install(c("SummarizedExperiment",
                        "DESeq2",
                        "survminer",
                        "corrplot"))
-
-
+```
 ## METHODS OVERVIEW
 
 - Data Source: TCGA RNA-Seq & clinical metadata (LUAD & LUSC)
@@ -69,13 +68,3 @@ BiocManager::install(c("SummarizedExperiment",
 - A "signature of lncRNAs", a group of lncRNAs that collectively characterize lung cancer.
   This signature is useful for patient stratification, dividing patients into groups like high-risk or low-risk based on their lncRNA patterns. 
 
-## REQUIRMENTS
-
-Install R libraries before running:
-
-```r
-BiocManager::install(c("TCGAbiolinks", "DESeq2", "pheatmap", "survival", "survminer", "ggplot2", "tibble", "dplyr", "RColorBrewer", "VennDiagram"))
-
-## FUTURE WORK
--Further examine which lncRNAs can serve as diagnostic or prognostic tools or both
--Correlate DE lncRNAs with demographic and clinical features
