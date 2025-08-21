@@ -58,7 +58,7 @@ library(GenomicRanges)
 library(GenomeInfoDb)
 #BiocManager::install("EnsDb.Hsapiens.v86")  # Human genome annotation database
 library(EnsDb.Hsapiens.v86)
-
+library(SummarizedExperiment)
 # Check all available genes from the Ensembl annotation database
 #Get all annotated human genes
 all_genes <- genes(EnsDb.Hsapiens.v86)
@@ -67,10 +67,10 @@ all_genes <- genes(EnsDb.Hsapiens.v86)
 unique(all_genes$gene_biotype)
 
 # Define a list of biotypes corresponding to long non-coding RNAs (lncRNAs)
-lncRNA_types <- c("lincRNA","macro_lncRNA","bidirectional_promoter_lncRNA",
-                  "sense_intronic", "sense_overlapping", "antisense")
+#lncRNA_types <- c("lincRNA", "macro_lncRNA", "3prime_overlapping_ncRNA", 
+# "bidirectional_promoter_lncRNA","sense_intronic", "sense_overlapping", "non_coding")
 
-
+lncRNA_types <- c("lincRNA","macro_lncRNA","bidirectional_promoter_lncRNA","sense_intronic", "sense_overlapping", "antisense")
 # Extract only the genes classified as lncRNAs
 lncRNA_genes <- all_genes[all_genes$gene_biotype %in% lncRNA_types, ]
 
@@ -106,6 +106,7 @@ write.csv(LUAD_counts_df, "LUAD_lncRNA.csv", row.names = TRUE)
 write.csv(LUSC_counts_df, "LUSC_lncRNA.csv", row.names = TRUE)
 
 #-----------------------DOWNLOADING FOR NORMAL SAMPLES--------------------------
+library(TCGAbiolinks)
 #Downloading the same data for normal samples in order to normalize counts and compare tumor vs normal
 # Query LUAD including Normal Samples
 query_LUAD_control <- GDCquery(
@@ -211,43 +212,6 @@ LUSC_combined <- cbind(LUSC_counts, LUSC_controls)
 write.csv(LUAD_combined, "LUAD_combined.csv")
 write.csv(LUSC_combined, "LUSC_combined.csv") 
 
-#=======Check if normal and tumor tissues come from the same paient
-
-# Function to extract patient ID
-get_patient_id <- function(barcode) {
-  # Remove _tumor/_normal
-  barcode <- sub("_(tumor|normal)$", "", barcode)
-  # Replace dots with dashes
-  barcode <- gsub("\\.", "-", barcode)
-  # Split into parts
-  parts <- strsplit(barcode, "-")[[1]]
-  # Return first 3 parts
-  paste(parts[1:3], collapse = "-")
-}
-
-# Apply to LUAD and LUSC
-luad_tumor_ids  <- sapply(luad_tumor, get_patient_id)
-luad_normal_ids <- sapply(luad_normal, get_patient_id)
-lusc_tumor_ids  <- sapply(lusc_tumor, get_patient_id)
-lusc_normal_ids <- sapply(lusc_normal, get_patient_id)
-
-# Build match tables
-luad_matches <- data.frame(
-  Normal_Sample = luad_normal,
-  Patient_ID = luad_normal_ids,
-  Matched_To_Tumor = luad_normal_ids %in% luad_tumor_ids
-)
-
-lusc_matches <- data.frame(
-  Normal_Sample = lusc_normal,
-  Patient_ID = lusc_normal_ids,
-  Matched_To_Tumor = lusc_normal_ids %in% lusc_tumor_ids
-)
-
-# Check
-table(luad_matches$Matched_To_Tumor)
-table(lusc_matches$Matched_To_Tumor)
-
 
 
 #------------------------------- Normalize counts ------------------------------
@@ -303,7 +267,6 @@ write.csv(assay(LUAD_vst), "LUAD_lncRNA_log_trans_after_norm.csv")
 write.csv(assay(LUSC_vst), "LUSC_lncRNA_log_trans_after_norm.csv")
 
 
-
 #=====Before and after VST plot and normalization for LUAD and LUSC
 
 # Load libraries
@@ -346,7 +309,9 @@ plot_expression <- function(raw_file, norm_file, vst_file, cancer_type) {
   combined$Stage <- factor(combined$Stage, levels = c("Raw", "VST"))
   
   # Remove extreme outliers
-  combined <- combined %>% filter(Counts < quantile(Counts, 0.999))
+  cutoff <- quantile(combined$Counts, 0.999, na.rm = TRUE)
+  combined <- combined %>% dplyr::filter(Counts < cutoff)
+  
   
   # Shorten sample labels and add group
   short_id <- sapply(strsplit(as.character(combined$Sample), "\\."), function(x) paste(x[1:3], collapse = "-"))
@@ -389,7 +354,6 @@ plot_expression(
   vst_file = "LUSC_lncRNA_log_trans_after_norm.csv",
   cancer_type = "LUSC"
 )
-
 
 #----------------------------- Differential Expression -------------------------
 #Perform DEA
@@ -743,8 +707,6 @@ print(p_luad)
 print(p_lusc)
 
 
-
-
 #----------------------- Download clinical data  -------------------------------
 # Load Required Libraries
 library(TCGAbiolinks) #Downloading and handling TCGA data
@@ -915,8 +877,6 @@ kbl(summary_table) %>%
   kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
 
 
-
-
 # -------- Build tumor-only, clinically matched expression matrices ------------
 #Load library
 library(readr)
@@ -1052,6 +1012,7 @@ print(p1)
 p2 <- run_pca_plot("LUSC_lncRNA_log_trans_after_norm.csv", "LUSC")
 ggsave("PCA_LUSC.png", plot = p2, width = 8, height = 6, dpi = 300)
 print(p2)
+
 
 
 
@@ -1223,6 +1184,154 @@ plot_stage_vs_normal_top15_facet_singlefile(
   cancer_type = "LUSC"
 )
 
+#=====fOR PPT
+
+#---------------- One-gene boxplot (mimics your faceted pipeline) ----------------
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+
+plot_stage_vs_normal_onegene_likefacet <- function(expr_file, clinical_file,
+                                                   gene,                # e.g. "FAM83A-AS1" or an Ensembl ID
+                                                   master_gene_label,   # names = Ensembl IDs, values = symbols
+                                                   cancer_type) {
+  # Load expression and clinical
+  expr <- read.csv(expr_file, row.names = 1)
+  clinical <- read.csv(clinical_file)
+  
+  # Identify tumor/normal columns
+  tumor_cols  <- grep("_tumor$",  colnames(expr), value = TRUE)
+  normal_cols <- grep("_normal$", colnames(expr), value = TRUE)
+  
+  # Extract expression matrices
+  expr_tumor  <- expr[, tumor_cols,  drop = FALSE]
+  expr_normal <- expr[, normal_cols, drop = FALSE]
+  
+  # Fix sample IDs exactly like your working function
+  fix_sample_ids <- function(ids) {
+    sapply(ids, function(x) {
+      parts <- unlist(strsplit(x, split = "\\."))
+      parts <- parts[parts != ""]
+      if (length(parts) >= 3) paste(parts[1:3], collapse = "-") else NA
+    })
+  }
+  colnames(expr_tumor)  <- fix_sample_ids(tumor_cols)
+  colnames(expr_normal) <- fix_sample_ids(normal_cols)
+  
+  # Match tumor samples to clinical
+  tumor_samples <- colnames(expr_tumor)
+  clinical_match <- clinical[match(tumor_samples, clinical$submitter_id), ]
+  
+  # Collapse stages to Stage I / Stage II (same logic as your working code)
+  stage_group <- gsub("^Stage\\s*([IV]+)[A-Z]*$", "Stage \\1",
+                      clinical_match$ajcc_pathologic_stage)
+  
+  # Keep only I/II for tumor; Normal for normals
+  group_tumor  <- ifelse(stage_group %in% c("Stage I", "Stage II"), stage_group, NA)
+  group_normal <- rep("Normal", length(normal_cols))
+  
+  # ----- Map the requested gene to the rowname used in expr -----
+  # If user provides Ensembl, strip version; if symbol provided, look it up in master_gene_label.
+  gene_id <- gene
+  if (!grepl("^ENSG", gene_id, ignore.case = TRUE)) {
+    # Provided a symbol -> find the first matching Ensembl ID in master mapping
+    hit <- names(master_gene_label)[master_gene_label == gene_id]
+    if (length(hit) > 0) gene_id <- gsub("\\..*$", "", hit[1])
+  } else {
+    gene_id <- gsub("\\..*$", "", gene_id)
+  }
+  # If still not found, allow direct match by rowname (in case rows are symbols)
+  if (!(gene_id %in% rownames(expr))) {
+    if (gene %in% rownames(expr)) gene_id <- gene
+  }
+  if (!(gene_id %in% rownames(expr))) {
+    stop(paste0("Gene '", gene, "' not found in the expression matrix (after mapping)."))
+  }
+  
+  # Resolve display symbol
+  gene_symbol <- ifelse(is.na(master_gene_label[gene_id]) | master_gene_label[gene_id] == "",
+                        gene, master_gene_label[gene_id])
+  
+  # Subset expression to the single gene
+  expr_tumor_g  <- expr_tumor [gene_id, , drop = FALSE]
+  expr_normal_g <- expr_normal[gene_id, , drop = FALSE]
+  
+  # Build long data frame (same structure as your faceted code, just one gene)
+  df_list <- list()
+  if (ncol(expr_tumor_g) > 0) {
+    df_list$tu <- data.frame(
+      expression = as.numeric(expr_tumor_g[1, ]),
+      group = group_tumor,
+      Gene  = gene_symbol
+    )
+  }
+  if (ncol(expr_normal_g) > 0) {
+    df_list$no <- data.frame(
+      expression = as.numeric(expr_normal_g[1, ]),
+      group = group_normal,
+      Gene  = gene_symbol
+    )
+  }
+  df <- bind_rows(df_list)
+  df <- df[!is.na(df$group), , drop = FALSE]
+  df$group <- factor(df$group, levels = c("Normal", "Stage I", "Stage II"))
+  
+  if (nrow(df) == 0) stop("No data to plot after filtering for Stage I/II and Normal.")
+  
+  # n per group (same label style)
+  label_df <- df %>%
+    group_by(group) %>%
+    summarise(n = n(),
+              y = max(expression, na.rm = TRUE) * 1.12,
+              .groups = "drop")
+  
+  # Wilcoxon comparisons (like your function)
+  comparisons_list <- list(c("Normal", "Stage I"), c("Normal", "Stage II"))
+  
+  # Plot (identical styling choices, but no facet)
+  p <- ggplot(df, aes(x = group, y = expression, fill = group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.8) +
+    geom_text(data = label_df, aes(x = group, y = y, label = paste0("n = ", n)),
+              inherit.aes = FALSE, size = 14, color = "black", fontface = "bold") +
+    stat_compare_means(comparisons = comparisons_list, method = "wilcox.test",
+                       label = "p.signif", size = 18, tip.length = 0.015,
+                       step.increase = 0.15, bracket.size = 2.5, bracket.colour = "black") +
+    scale_fill_manual(values = c("Normal" = "#F4A8A8", "Stage I" = "#A0A0A0", "Stage II" = "#A80000")) +
+    coord_cartesian(clip = "off") +
+    labs(title = paste0("Expression of ", gene_symbol, " (", cancer_type, ")"),
+         x = "Group", y = "VST expression") +
+    theme_minimal(base_size = 25) +
+    theme(
+      plot.title = element_text(size = 48, face = "bold", hjust = 0.5, margin = margin(b = 22)),
+      axis.text.x = element_text(angle = 48, hjust = 1, size = 28, face = "bold"),
+      axis.title.x = element_text(size = 40, face = "bold"),
+      axis.title.y = element_text(size = 44, face = "bold"),
+      axis.text.y = element_text(size = 40, face = "bold"),
+      legend.position = "none",
+      plot.margin = margin(t = 90, r = 20, b = 20, l = 20)
+    )
+  
+  out <- paste0("OneGene_", gene_symbol, "_", cancer_type, "_Stage_I_II.png")
+  ggsave(out, plot = p, width = 14, height = 16, dpi = 300)
+  print(p)
+  cat("Saved plot:", out, "\n")
+}
+
+plot_stage_vs_normal_onegene_likefacet(
+  expr_file = "LUAD_lncRNA_log_trans_after_norm.csv",
+  clinical_file = "clinical_LUAD_clean.csv",
+  gene = "FAM83A-AS1",
+  master_gene_label = master_gene_label,
+  cancer_type = "LUAD"
+)
+
+plot_stage_vs_normal_onegene_likefacet(
+  expr_file = "LUSC_lncRNA_log_trans_after_norm.csv",
+  clinical_file = "clinical_LUSC_clean.csv",
+  gene = "CASC9",
+  master_gene_label = master_gene_label,
+  cancer_type = "LUSC"
+)
 
 
 
@@ -1395,12 +1504,11 @@ lusc <- lusc %>% mutate(cancer = "LUSC", gene_symbol = toupper(gene_symbol))
 
 # Combine LUAD and LUSC results into a single dataframe
 combined <- bind_rows(luad, lusc)
-
 # Filter genes of interest
-# Select only specific genes and their cancer types (e.g., ZFPM2-AS1 in LUAD and LINC00511 in LUSC)
 filtered <- combined %>%
   filter(
-    (gene_symbol == "ZFPM2-AS1" & cancer == "LUAD") |
+    (gene_symbol == "FAM83A-AS1" & cancer == "LUAD") |
+      (gene_symbol == "LANCL1-AS1" & cancer == "LUAD") |
       (gene_symbol == "LINC00511" & cancer == "LUSC")
   ) %>%
   mutate(
@@ -1410,7 +1518,7 @@ filtered <- combined %>%
     # Create a factor variable indicating statistical significance of Cox p-value
     significance = factor(
       ifelse(Cox_pval < 0.05, "Significant", "Not significant"),
-      levels = c("Significant", "Not significant")  # Ensure consistent color mapping
+      levels = c("Significant", "Not significant")
     ),
     
     # Reverse label order for top-down plotting
@@ -1471,7 +1579,6 @@ ggplot(filtered, aes(x = label, y = HR, ymin = lower_CI, ymax = upper_CI)) +
   )
 
 
-
 #------------------------- Correlate Age with Top 15 DEGs ----------------------
 # Load required libraries 
 library(AnnotationDbi)
@@ -1509,8 +1616,10 @@ correlate_age <- function(expr_file, clinical_file, cancer_type, top15_genes, ma
   # Match clinical to expression samples
   clinical <- clinical[match(colnames(expr), clinical$submitter_id), ]
   
-  # Convert age from days to years
-  clinical$age <- as.numeric(clinical$age_at_diagnosis) / 365
+  
+  # Use age_at_index 
+  clinical$age <- as.numeric(clinical$age_at_index)
+  
   
   # Run correlation for Top 15 DEGs
   results <- lapply(top15_genes, function(gene) {
@@ -1587,7 +1696,7 @@ lusc <- read.csv("LUSC_tumor_age_correlation_top15.csv")
 #Format LUAD Matrix 
 luad_filtered <- luad %>%
   #Filter out rows with NA in spearman_rho
-  filter(!is.na(spearman_rho)) %>%
+  dplyr::filter(!is.na(spearman_rho)) %>%
   # Mutate labels for significance
   #If padk<0.005 and abs spearman rho>0.1 then add a star to indicate a meaningful cor
   mutate(label = ifelse(padj < 0.05 & abs(spearman_rho) > 0.1,
@@ -1600,9 +1709,9 @@ luad_filtered <- luad %>%
 #Format LUSC Matrix as LUAD
 lusc_filtered <- lusc %>%
   #Filter out rows with NA in spearman_rho
-  filter(!is.na(spearman_rho)) %>%
+  dplyr::filter(!is.na(spearman_rho)) %>%
   # Mutate labels for significance
-  #If padk<0.005 and abs spearman rho>0.1 then add a star to indicate a meaningful cor
+  #If padj<0.005 and abs spearman rho>0.1 then add a star to indicate a meaningful cor
   mutate(label = ifelse(padj < 0.05 & abs(spearman_rho) > 0.1,
                         paste0(sprintf("%.2f", spearman_rho), "*"),
                         sprintf("%.2f", spearman_rho))) %>%
@@ -1657,7 +1766,6 @@ p2 <- pheatmap(lusc_mat,
 png("Age_Correlation_Heatmap_LUAD_LUSC_with_stars.png", width = 2500, height = 1500, res = 200)  # also increase output size
 grid.arrange(p1[[4]], p2[[4]], ncol = 2)
 dev.off()
-
 #==========Plot exp vs age bins
 # Load required libraries
 library(ggplot2)   # For plotting
@@ -1665,7 +1773,7 @@ library(ggpubr)    # For statistical comparisons (e.g., p-value annotations)
 library(tidyverse) # For data wrangling
 
 # Main function to plot expression of top genes across age bins, stratified by sample type (tumor/normal)
-plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, clinical_file, cancer_type, top15_genes, master_gene_label, pairwise = FALSE, sample_type = c("tumor", "normal")) {
+plot_age_bin_per_gene_with_significance_flex_v5 <- function(vst_file, clinical_file, cancer_type, top15_genes, master_gene_label, pairwise = FALSE, sample_type = c("tumor", "normal")) {
   
   # Ensure sample_type is either "tumor" or "normal"
   sample_type <- match.arg(sample_type)
@@ -1686,7 +1794,7 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
   top15_genes_clean <- gsub("\\..*", "", top15_genes)
   
   # Function to fix sample IDs to match clinical$submitter_id
-  ffix_sample_ids <- function(ids) {
+  fix_sample_ids <- function(ids) {
     ids <- gsub("(_tumor|_normal)$", "", ids, ignore.case = TRUE)  # remove suffix
     ids <- gsub("\\.", "-", ids)                                   # safety: dots -> dashes
     vapply(ids, function(x) {
@@ -1695,7 +1803,6 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
     }, character(1))
   }
   
-  
   # Fix column names in expression matrix
   colnames(expr) <- fix_sample_ids(colnames(expr))
   
@@ -1703,9 +1810,10 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
   clinical <- clinical[match(colnames(expr), clinical$submitter_id), ]
   
   # Convert age from days to years
-  clinical$age <- as.numeric(clinical$age_at_diagnosis) / 365
+  # Use age_at_index directly (already in years)
+  clinical$age <- as.numeric(clinical$age_at_index)
   
-  # Loop through each gene and create a violin plot
+  # Loop through each gene and create a boxplot
   for (gene in top15_genes_clean) {
     
     # Skip if gene not found in expression data
@@ -1757,9 +1865,11 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
       )
       
       # Start building the plot
-      p <- ggplot(df, aes(x = age_bin, y = expression)) +
-        geom_violin(trim = FALSE, fill = "#A80000", color = "black", alpha = 0.7) +  # Violin plot
-        geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.5)                 # Boxplot overlay
+      p <- ggplot(df, aes(x = age_bin, y = expression, fill = age_bin)) +
+        #--- Boxplot only (no jitter) ---
+        geom_boxplot(width = 0.6, outlier.shape = NA, color = "black", alpha = 0.8) +
+        # Custom colors for bins
+        scale_fill_manual(values = c("50-59" = "red", "60-69" = "lightcoral", "70-89" = "grey70"))
       
       # Add statistical comparison (Wilcoxon pairwise or Kruskal-Wallis global)
       if (pairwise && !is.null(my_comparisons)) {
@@ -1783,7 +1893,8 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
           axis.title.x = element_text(size = 16, face = "bold"),
           axis.title.y = element_text(size = 16, face = "bold"),
           axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
-          axis.text.y = element_text(size = 14)
+          axis.text.y = element_text(size = 14),
+          legend.position = "none"   # Remove redundant legend (since x-axis already labels bins)
         )
       
       # Save plot to PNG with filename indicating sample type and test type
@@ -1797,18 +1908,16 @@ plot_age_bin_violin_per_gene_with_significance_flex_v5 <- function(vst_file, cli
   }
   
   # Done message
-  cat("Finished saving violin plots for", cancer_type, "-", sample_type, "\n")
+  cat("Finished saving boxplots for", cancer_type, "-", sample_type, "\n")
 }
 
-
 # LUAD Tumor and Normal
-plot_age_bin_violin_per_gene_with_significance_flex_v5("LUAD_lncRNA_log_trans_after_norm.csv", "clinical_LUAD_clean.csv", "LUAD", top15_LUAD, master_gene_label, pairwise = TRUE, sample_type = "tumor")
-plot_age_bin_violin_per_gene_with_significance_flex_v5("LUAD_lncRNA_log_trans_after_norm.csv", "clinical_LUAD_clean.csv", "LUAD", top15_LUAD, master_gene_label, pairwise = TRUE, sample_type = "normal")
+plot_age_bin_per_gene_with_significance_flex_v5("LUAD_lncRNA_log_trans_after_norm.csv", "clinical_LUAD_clean.csv", "LUAD", top15_LUAD, master_gene_label, pairwise = TRUE, sample_type = "tumor")
+plot_age_bin_per_gene_with_significance_flex_v5("LUAD_lncRNA_log_trans_after_norm.csv", "clinical_LUAD_clean.csv", "LUAD", top15_LUAD, master_gene_label, pairwise = TRUE, sample_type = "normal")
 
 # LUSC Tumor and Normal
-plot_age_bin_violin_per_gene_with_significance_flex_v5("LUSC_lncRNA_log_trans_after_norm.csv", "clinical_LUSC_clean.csv", "LUSC", top15_LUSC, master_gene_label, pairwise = TRUE, sample_type = "tumor")
-plot_age_bin_violin_per_gene_with_significance_flex_v5("LUSC_lncRNA_log_trans_after_norm.csv", "clinical_LUSC_clean.csv", "LUSC", top15_LUSC, master_gene_label, pairwise = TRUE, sample_type = "normal")
-
+plot_age_bin_per_gene_with_significance_flex_v5("LUSC_lncRNA_log_trans_after_norm.csv", "clinical_LUSC_clean.csv", "LUSC", top15_LUSC, master_gene_label, pairwise = TRUE, sample_type = "tumor")
+plot_age_bin_per_gene_with_significance_flex_v5("LUSC_lncRNA_log_trans_after_norm.csv", "clinical_LUSC_clean.csv", "LUSC", top15_LUSC, master_gene_label, pairwise = TRUE, sample_type = "normal")
 
 #------------------Survival Analysis for DE lncRNAs correlated with age---------
 # Load required libraries
@@ -1979,6 +2088,7 @@ age_stratified_survival_and_cox(expr_matrix = LUAD_expr,clinical_df = clinical_L
 # Apply to LUSC
 age_stratified_survival_and_cox(expr_matrix = LUSC_expr,clinical_df = clinical_LUSC,top15_genes = top15_LUSC,
                                 master_gene_label = master_gene_label,cancer_type = "LUSC",save_all_plots = TRUE)
+
 
 
 # --------------------- Correlate Gender with Top 15 DEGs ----------------------
@@ -2927,6 +3037,7 @@ smoking_stratified_survival_and_cox(
   expr_matrix = LUSC_expr,clinical_df = clinical_LUSC,top15_genes = top15_LUSC,
   master_gene_label = master_gene_label,cancer_type = "LUSC",save_all_plots = TRUE)
 
+
 # ------------------------ Stage-Based Analysis of lncRNAs ------------------------
 # Kruskal-Wallis test to identify DE lncRNAs significantly different by stage (I, II, III, IV)
 # Stage-Based Analysis of lncRNAs (Top 15) with Kruskal–Wallis tests
@@ -3445,6 +3556,7 @@ stage_stratified_survival_and_cox(
 
 
 
+
 #---------------------------- Multivariate Cox Regression ----------------------
 # Multivariate Cox Regression for Top 15 lncRNAs (adjusting for age, gender, smoking, stage)
 # Load required libraries
@@ -3718,6 +3830,7 @@ ggsave("multivariate_forest_plot_FIXED.png", plot = p, width = 10, height = 10, 
 
 
 
+
 #----------------- Evaluate 2- and 3-gene lncRNA signatures for survival -------
 
 # Evaluate 2- and 3-gene lncRNA signatures for survival (using precomputed OS/event)
@@ -3901,7 +4014,7 @@ ranked_LUSC$km_pval <- sapply(ranked_LUSC$signature, function(sig) get_km_pval(d
 
 
 # Plot and save KM curves for significant signatures
-plot_top_signatures <- function(df, ranked, master_gene_label, prefix, top_n = 5) {
+plot_top_signatures <- function(df, ranked, master_gene_label, prefix, top_n = 20) {
   if (nrow(ranked) == 0) return(invisible(NULL))
   top_n <- min(top_n, nrow(ranked))
   for (i in seq_len(top_n)) {
@@ -3962,10 +4075,10 @@ sig_LUSC <- sig_LUSC[order(sig_LUSC$km_pval), ]
 
 #Save results
 write.csv(sig_LUAD, "LUAD_top_significant_by_KM_pval.csv", row.names = FALSE)
-write.csv(head(sig_LUAD, 5), "LUAD_top5_significant_by_KM_pval.csv", row.names = FALSE)
+write.csv(head(sig_LUAD, 20), "LUAD_top5_significant_by_KM_pval.csv", row.names = FALSE)
 
 write.csv(sig_LUSC, "LUSC_top_significant_by_KM_pval.csv", row.names = FALSE)
-write.csv(head(sig_LUSC, 5), "LUSC_top5_significant_by_KM_pval.csv", row.names= FALSE)
+write.csv(head(sig_LUSC, 20), "LUSC_top5_significant_by_KM_pval.csv", row.names= FALSE)
 
 # Plot significant signatures (KM curves)
 if (nrow(sig_LUAD) > 0) {
@@ -3974,6 +4087,8 @@ if (nrow(sig_LUAD) > 0) {
 if (nrow(sig_LUSC) > 0) {
   plot_top_signatures(df_LUSC, sig_LUSC, master_gene_label, "LUSC")
 }
+
+
 
 
 
@@ -4063,7 +4178,7 @@ library(dplyr)
 # Get all Ensembl genes and subset to protein_coding
 all_genes_df <- genes(EnsDb.Hsapiens.v86, return.type = "data.frame")
 pc_gene_ids <- all_genes_df %>%
-  filter(gene_biotype == "protein_coding") %>%
+  dplyr::filter(gene_biotype == "protein_coding") %>%
   pull(gene_id)
 
 # Helper: strip version from Ensembl IDs (e.g., ENSG...1.2 -> ENSG...1)
@@ -4203,11 +4318,6 @@ vst_LUSC <- assay(LUSC_mRNA_vst); colnames(vst_LUSC) <- colnames(LUSC_mRNA_combi
 write.csv(vst_LUAD, "LUAD_mrna_log_trans_after_norm.csv")
 write.csv(vst_LUSC, "LUSC_mrna_log_trans_after_norm.csv")
 
-# Also save VST of NORMAL-ONLY (so later clinical matching for normals can load it)
-LUAD_vst_normal_only <- vst_LUAD[, grepl("_normal$", colnames(vst_LUAD), ignore.case = TRUE), drop = FALSE]
-LUSC_vst_normal_only <- vst_LUSC[, grepl("_normal$", colnames(vst_LUSC), ignore.case = TRUE), drop = FALSE]
-write.csv(LUAD_vst_normal_only, "LUAD_control_mRNA_log_trans_after_norm.csv")
-write.csv(LUSC_vst_normal_only, "LUSC_control_mRNA_log_trans_after_norm.csv")
 
 #----------------------------- Differential Expression -------------------------
 # Perform DEA Tumor vs Normal. Save both unshrunken and shrunken results,
@@ -4295,13 +4405,13 @@ save(master_gene_label, file = "master_gene_label_mRNA.RData")
 library(dplyr)
 
 sig_deg_LUAD_mRNA <- deg_LUAD_mRNA_allshrink %>%
-  filter(!is.na(padj)) %>%
-  filter(padj < 0.01 & abs(log2FoldChange) > 1) %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::filter(padj < 0.01 & abs(log2FoldChange) > 1) %>%
   arrange(padj, desc(abs(log2FoldChange)))
 
 sig_deg_LUSC_mRNA <- deg_LUSC_mRNA_allshrink %>%
-  filter(!is.na(padj)) %>%
-  filter(padj < 0.01 & abs(log2FoldChange) > 1) %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::filter(padj < 0.01 & abs(log2FoldChange) > 1) %>%
   arrange(padj, desc(abs(log2FoldChange)))
 
 top15_LUAD_mRNA <- rownames(sig_deg_LUAD_mRNA)[1:min(15, nrow(sig_deg_LUAD_mRNA))]
@@ -4417,6 +4527,21 @@ write_csv(clinical_LUSC, "clinical_LUSC_clean.csv")
 
 #----------------------------- Correlation of mRNAs and lncRNAs-----------------
 library(corrplot)
+
+# assumes you already created master_gene_label earlier
+
+make_top15_with_symbols <- function(in_csv, out_csv) {
+  x <- read.csv(in_csv, check.names = FALSE)
+  ids <- gsub("\\..*", "", if ("gene_id" %in% names(x)) x$gene_id else x$ensembl_gene_id)
+  syms <- ifelse(is.na(master_gene_label[ids]) | master_gene_label[ids] == "",
+                 ids, master_gene_label[ids])
+  out <- data.frame(ensembl_gene_id = ids, hgnc_symbol = syms, stringsAsFactors = FALSE)
+  write.csv(out, out_csv, row.names = FALSE)
+}
+
+# lncRNA
+make_top15_with_symbols("LUAD_top15_DEGs.csv", "LUAD_top15_lncRNA_with_gene_names.csv")
+make_top15_with_symbols("LUSC_top15_DEGs.csv", "LUSC_top15_lncRNA_with_gene_names.csv")
 
 #safe TCGA ID cleaner (keeps TCGA-XX-XXXX if present; never returns NA)
 clean_tcga_3_safe <- function(x) {
@@ -4564,7 +4689,3 @@ run_one_cancer(
   top15_lnc_csv = "LUSC_top15_lncRNA_with_gene_names.csv",
   top15_mrna_csv= "LUSC_top15_mRNA_with_gene_names.csv"
 )
-
-
-
-
