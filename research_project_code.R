@@ -67,9 +67,8 @@ all_genes <- genes(EnsDb.Hsapiens.v86)
 unique(all_genes$gene_biotype)
 
 # Define a list of biotypes corresponding to long non-coding RNAs (lncRNAs)
-lncRNA_types <- c("lincRNA", "macro_lncRNA", "3prime_overlapping_ncRNA", 
-                  "bidirectional_promoter_lncRNA", "processed_transcript", 
-                  "sense_intronic", "sense_overlapping", "non_coding")
+lncRNA_types <- c("lincRNA","macro_lncRNA","bidirectional_promoter_lncRNA",
+                  "sense_intronic", "sense_overlapping", "antisense")
 
 
 # Extract only the genes classified as lncRNAs
