@@ -20,6 +20,7 @@ The project includes:
 - `*.R` : Scripts for data preprocessing, differential expression analysis, survival analysis, and correlation between lncRNAs and mRNAs.
 - `sessionInfo.txt` : R environment details to reproduce the analysis.
 - `README.md` : Instructions and project overview.
+-  `plots/` : Figures and visual outputs (MA plots, PCA, boxplots, survival curves, heatmaps).
 
 
 ## OBJECTIVE
